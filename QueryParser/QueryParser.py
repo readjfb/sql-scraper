@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import sqlglot
 from sqlglot import expressions as exp
 
-from Column import Column
+from .Column import Column
 
 
 class QueryParser:

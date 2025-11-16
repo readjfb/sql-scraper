@@ -20,14 +20,14 @@ class Column:
 
     def as_dict(self) -> dict:
         """
-        Representation used by Feature 1 in objective.md.
+        Dict Representation of the class
         """
         return {
             "name": self.col_name,
             "potential_tables": list(self.potential_tables),
         }
 
-    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+    def __repr__(self) -> str:
         return (
             f"Column(name='{self.col_name}', "
             f"potential_tables={self.potential_tables}, "

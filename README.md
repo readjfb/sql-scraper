@@ -13,7 +13,18 @@ It is designed for schema exploration, automated lineage capture, and static ana
 pip install sqlglot
 ```
 
-Clone/download this repository and ensure it is on your `PYTHONPATH`.
+Clone/download this repository and ensure it is on your `PYTHONPATH`. The simplest option is to place the `QueryParser` folder in the same directory as the script or notebook that uses it:
+
+```
+your_project/
+├── my_script.py
+└── QueryParser/
+    ├── __init__.py
+    ├── QueryParser.py
+    └── Column.py
+```
+
+With this layout you can import it with `from QueryParser import QueryParser` without worrying about the path.
 
 ## QueryParser at a Glance
 
@@ -144,7 +155,7 @@ python parser_tester.py
 | File               | Purpose                                                                 |
 | ------------------ | ----------------------------------------------------------------------- |
 | `QueryParser.py`   | Main parser module; exposes column / join features and lineage helpers. |
-| `Column.py`        | Dataclass definition used by the parser.                                |
+| `Column.py`        | Dataclass definition of a class used by the parser.                     |
 | `parser_tester.py` | End-to-end regression suite using Python's `unittest`.                  |
 
 ## Notes & Tips
