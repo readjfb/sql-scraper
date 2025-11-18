@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from threading import RLock
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import sqlglot
 from sqlglot import expressions as exp
@@ -19,17 +19,18 @@ class QueryParser:
         self._dialect = dialect
         self._expression = sqlglot.parse_one(query, read=self._dialect)
         self._source_tables: List[str] = []
+        self._alias_column_lineage: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+        self._alias_display_names: Dict[str, str] = {}
         (
             self._cte_context,
             self._cte_definitions,
             self._cte_column_lineage,
         ) = self._collect_cte_sources(self._expression)
-        self._alias_column_lineage: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
-        self._alias_display_names: Dict[str, str] = {}
         self._alias_to_table, self._source_tables = self._collect_tables()
         self._select_context_cache: Dict[int, dict] = {}
         self._source_columns: Optional[List[Column]] = None
         self._joins: Optional[List[dict]] = None
+        self._filters: Optional[List[dict]] = None
         self._lock = RLock()
 
     def source_columns(self) -> List[Column]:
@@ -52,6 +53,24 @@ class QueryParser:
             if self._joins is None:
                 self._joins = self._extract_joins()
             return self._joins
+
+    def source_tables(self) -> List[str]:
+        """Return ordered list of unique source tables referenced by the query."""
+        with self._lock:
+            return list(self._source_tables)
+
+    def filters(self) -> List[dict]:
+        """
+        Return structured WHERE/HAVING metadata for every SELECT in the query.
+        """
+        with self._lock:
+            if self._filters is None:
+                self._filters = self._extract_filters()
+            return self._filters
+
+    def get_filters(self) -> List[dict]:
+        """Alias for ``filters`` to align with external call sites."""
+        return self.filters()
 
     def feature_columns(self) -> List[dict]:
         """
@@ -145,10 +164,14 @@ class QueryParser:
             if isinstance(entry, dict):
                 name = entry.get("name") or column
                 tables = list(entry.get("tables") or [])
+                lineage_entries = self._normalize_lineage_entries(entry.get("lineage"))
             else:
                 name = column
                 tables = list(entry or [])
+                lineage_entries = []
             normalized_lineage[column.lower()] = {"name": name, "tables": tables}
+            if lineage_entries:
+                normalized_lineage[column.lower()]["lineage"] = lineage_entries
 
         for variant in [key, key.lower(), key.upper()]:
             alias_map[variant] = normalized_value
@@ -198,6 +221,13 @@ class QueryParser:
                 select_context,
                 column_name,
             )
+            lineage_entries = self._column_lineage_for_reference(
+                column.table,
+                select_context,
+                column_name,
+            )
+            if lineage_entries:
+                continue
             key = (column_name.lower(), tuple(potential_tables))
             if key in seen:
                 continue
@@ -221,6 +251,8 @@ class QueryParser:
             for entry in (relation.get("columns") or {}).values():
                 name = entry.get("name")
                 tables = entry.get("tables", [])
+                if entry.get("lineage"):
+                    continue
                 if not name or not tables:
                     continue
                 expanded.append(Column(col_name=name, potential_tables=list(tables)))
@@ -281,6 +313,23 @@ class QueryParser:
             joins.extend(self._extract_joins_for_select(select))
         return joins
 
+    def _extract_filters(self) -> List[dict]:
+        """Collect WHERE and HAVING clauses from every SELECT statement."""
+        filters: List[dict] = []
+        for select in self._expression.find_all(exp.Select):
+            context = self._select_context(select)
+            where = select.args.get("where")
+            if where and where.this:
+                filters.extend(
+                    self._filters_from_condition(where.this, "WHERE", context)
+                )
+            having = select.args.get("having")
+            if having and having.this:
+                filters.extend(
+                    self._filters_from_condition(having.this, "HAVING", context)
+                )
+        return filters
+
     def _extract_joins_for_select(self, select: exp.Select) -> List[dict]:
         """Return joins for a single SELECT statement."""
         joins: List[dict] = []
@@ -328,8 +377,66 @@ class QueryParser:
         parts.append("JOIN")
         return " ".join(parts)
 
+    def _filters_from_condition(
+        self,
+        condition: exp.Expression,
+        filter_type: str,
+        select_context: dict,
+    ) -> List[dict]:
+        """Return normalized filter metadata for a WHERE/HAVING clause."""
+        filters: List[dict] = []
+        comparators = self._flatten_conditions(condition)
+        if not comparators:
+            return filters
+
+        for comparator in comparators:
+            columns = self._filter_columns(comparator, select_context)
+            entry = {
+                "query": comparator.sql(dialect=self._dialect),
+                "filter_type": filter_type,
+                "operator": self._format_filter_operator(comparator),
+                "columns": columns,
+            }
+            filters.append(entry)
+
+        return filters
+
+    def _filter_columns(
+        self, comparator: exp.Expression, select_context: dict
+    ) -> List[Column]:
+        """Return unique Column objects involved in a comparator expression."""
+        columns: List[Column] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for column_expr in comparator.find_all(exp.Column):
+            column = self._column_with_lineage(column_expr, select_context)
+            if column is None:
+                continue
+            key = (column.col_name.lower(), tuple(column.potential_tables))
+            if key in seen:
+                continue
+            seen.add(key)
+            columns.append(column)
+        return columns
+
+    def _format_filter_operator(self, comparator: exp.Expression) -> str:
+        """Return a human-readable operator string for a comparator expression."""
+        operator_map = {
+            exp.EQ: "=",
+            exp.NEQ: "!=",
+            exp.LT: "<",
+            exp.LTE: "<=",
+            exp.GT: ">",
+            exp.GTE: ">=",
+        }
+        for expression_type, symbol in operator_map.items():
+            if isinstance(comparator, expression_type):
+                return symbol
+        return comparator.key.upper()
+
     def _column_from_expression(
-        self, expression: Optional[exp.Expression]
+        self,
+        expression: Optional[exp.Expression],
+        select_context: Optional[dict] = None,
     ) -> Optional[Column]:
         """Build a Column object from a sqlglot expression if possible."""
         if not isinstance(expression, exp.Column):
@@ -339,8 +446,31 @@ class QueryParser:
         if not column_name:
             return None
 
-        potential_tables = self._resolve_column_sources(expression.table)
+        potential_tables = self._resolve_column_sources(
+            expression.table, select_context, column_name
+        )
         return Column(col_name=column_name, potential_tables=potential_tables)
+
+    def _column_with_lineage(
+        self, column: exp.Column, select_context: Optional[dict]
+    ) -> Optional[Column]:
+        """Build a Column with lineage information for a filter expression."""
+        column_name = column.name
+        if not column_name:
+            return None
+
+        potential_tables = self._resolve_column_sources(
+            column.table, select_context, column_name
+        )
+        lineage_entries = self._column_lineage_for_reference(
+            column.table, select_context, column_name
+        )
+        lineage_columns = self._build_lineage_columns(lineage_entries)
+        return Column(
+            col_name=column_name,
+            potential_tables=potential_tables,
+            lineage=lineage_columns or None,
+        )
 
     def _format_lineage_map(
         self, lineage: Dict[str, Dict[str, List[str]]]
@@ -437,11 +567,15 @@ class QueryParser:
                 continue
 
             tables = self._tables_for_projection(projection, context)
+            projection_lineage = self._projection_lineage(projection, context)
             if tables:
-                lineage[output_name.lower()] = {
+                entry = {
                     "name": output_name,
                     "tables": sorted(set(tables)),
                 }
+                if projection_lineage:
+                    entry["lineage"] = projection_lineage
+                lineage[output_name.lower()] = entry
 
         return lineage
 
@@ -494,7 +628,7 @@ class QueryParser:
         left_source_set = set(left_sources)
         right_source_set = set(right_sources)
 
-        for comparator in self._flatten_join_conditions(condition):
+        for comparator in self._flatten_conditions(condition):
             left_column, complex_left = self._extract_join_operand(
                 comparator.args.get("this")
             )
@@ -536,7 +670,7 @@ class QueryParser:
 
         return result
 
-    def _flatten_join_conditions(
+    def _flatten_conditions(
         self, condition: Optional[exp.Expression]
     ) -> List[exp.Expression]:
         """Flatten nested AND/OR trees into a list of comparison expressions."""
@@ -545,8 +679,8 @@ class QueryParser:
 
         logical_types = (exp.And, exp.Or)
         if isinstance(condition, logical_types):
-            left_conditions = self._flatten_join_conditions(condition.args.get("this"))
-            right_conditions = self._flatten_join_conditions(
+            left_conditions = self._flatten_conditions(condition.args.get("this"))
+            right_conditions = self._flatten_conditions(
                 condition.args.get("expression")
             )
             return left_conditions + right_conditions
@@ -589,18 +723,24 @@ class QueryParser:
         return pairs
 
     def _extract_join_operand(
-        self, expression: Optional[exp.Expression]
+        self,
+        expression: Optional[exp.Expression],
+        select_context: Optional[dict] = None,
     ) -> Tuple[Optional[Column], Optional[str]]:
         """Return (Column, complex_sql) for a join comparator operand."""
         if expression is None:
             return None, None
 
         if isinstance(expression, exp.Column):
-            return self._column_from_expression(expression), None
+            return self._column_from_expression(expression, select_context), None
 
         complex_sql = expression.sql(dialect=self._dialect)
         nested_column = next(expression.find_all(exp.Column), None)
-        column = self._column_from_expression(nested_column) if nested_column else None
+        column = (
+            self._column_from_expression(nested_column, select_context)
+            if nested_column
+            else None
+        )
         if column is None:
             column = Column(col_name=complex_sql, potential_tables=[])
         return column, complex_sql
@@ -744,12 +884,17 @@ class QueryParser:
             return None
 
         if isinstance(relation, exp.Table):
+            alias_token = relation.args.get("alias")
             alias = relation.alias or relation.name
             tables = self._sources_for_table_reference(relation, table_context)
             column_lineage = {}
-            if alias:
+            if alias_token and alias:
                 column_lineage = column_context.get(alias.lower(), column_lineage)
-            if relation.name:
+            has_qualifier = bool(
+                self._identifier_name(relation.args.get("db"))
+                or self._identifier_name(relation.args.get("catalog"))
+            )
+            if relation.name and not has_qualifier:
                 column_lineage = column_context.get(
                     relation.name.lower(), column_lineage
                 )
@@ -828,3 +973,131 @@ class QueryParser:
                 return self._merge_sources([], matches)
 
         return list(default_tables)
+
+    def _projection_lineage(self, projection: exp.Expression, context: dict) -> List[dict]:
+        """Return normalized column lineage entries for a projection expression."""
+        dependencies: List[dict] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+
+        for column in projection.find_all(exp.Column):
+            column_name = column.name
+            if not column_name:
+                continue
+            tables = self._resolve_column_sources(
+                column.table,
+                context,
+                column.name,
+            )
+            key = (column_name.lower(), tuple(tables))
+            if key in seen:
+                continue
+            seen.add(key)
+            entry: Dict[str, Any] = {
+                "name": column_name,
+                "tables": list(tables),
+            }
+            nested_lineage = self._column_lineage_for_reference(
+                column.table,
+                context,
+                column_name,
+            )
+            if nested_lineage:
+                entry["lineage"] = nested_lineage
+            dependencies.append(entry)
+
+        return dependencies
+
+    def _column_lineage_for_reference(
+        self,
+        qualifier: Optional[str],
+        select_context: Optional[dict],
+        column_name: Optional[str],
+    ) -> List[dict]:
+        """Return normalized lineage entries for a column reference if known."""
+        if not column_name:
+            return []
+        select_context = select_context or {}
+        column_key = column_name.lower()
+        matches: List[dict] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+
+        def extend_from_entry(entry: Optional[dict]) -> None:
+            if not entry:
+                return
+            normalized = self._normalize_lineage_entries(entry.get("lineage"))
+            for component in normalized:
+                name = component.get("name")
+                if not name:
+                    continue
+                tables = tuple(component.get("tables") or [])
+                key = (name.lower(), tables)
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(component)
+
+        if qualifier:
+            for relation in self._relations_for_qualifier(select_context, qualifier):
+                columns = relation.get("columns") or {}
+                extend_from_entry(columns.get(column_key))
+
+            qualifier_variants = [qualifier, qualifier.lower(), qualifier.upper()]
+            for alias in qualifier_variants:
+                alias_lineage = self._alias_column_lineage.get(alias.lower())
+                if alias_lineage:
+                    extend_from_entry(alias_lineage.get(column_key))
+            return matches
+
+        for relation in select_context.get("relations", []):
+            columns = relation.get("columns") or {}
+            extend_from_entry(columns.get(column_key))
+        return matches
+
+    def _build_lineage_columns(
+        self, entries: Optional[List[dict]]
+    ) -> List[Column]:
+        """Convert normalized lineage metadata into Column objects."""
+        lineage_columns: List[Column] = []
+        for entry in entries or []:
+            name = entry.get("name")
+            if not name:
+                continue
+            tables = list(entry.get("tables") or [])
+            nested_entries = entry.get("lineage")
+            nested_columns = self._build_lineage_columns(nested_entries)
+            lineage_columns.append(
+                Column(
+                    col_name=name,
+                    potential_tables=tables,
+                    lineage=nested_columns or None,
+                )
+            )
+        return lineage_columns
+
+    def _normalize_lineage_entries(
+        self, entries: Optional[List[Any]]
+    ) -> List[Dict[str, Any]]:
+        """Ensure lineage entries are stored using primitive dict structures."""
+        normalized: List[Dict[str, Any]] = []
+        for entry in entries or []:
+            if isinstance(entry, Column):
+                name = entry.col_name
+                tables = list(entry.potential_tables)
+                nested = (
+                    self._normalize_lineage_entries(entry.lineage)
+                    if entry.lineage
+                    else []
+                )
+            elif isinstance(entry, dict):
+                name = entry.get("name")
+                tables = list(entry.get("tables") or [])
+                nested = self._normalize_lineage_entries(entry.get("lineage"))
+            else:
+                continue
+            if not name:
+                continue
+            normalized_entry: Dict[str, Any] = {"name": name, "tables": tables}
+            if nested:
+                normalized_entry["lineage"] = nested
+            normalized.append(normalized_entry)
+        return normalized

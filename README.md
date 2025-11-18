@@ -93,6 +93,35 @@ Returns the captured lineage map per alias. With no argument it returns every al
 {"r": {"account_id": ["core.accounts"], "balance": ["core.accounts"]}}
 ```
 
+### `filters()` / `get_filters()`
+
+Surfaces every `WHERE`/`HAVING` comparator in the query. Each entry includes the raw SQL snippet, the clause type, operator, and the columns (with lineage) referenced inside the predicate:
+
+```python
+>>> parser.filters()
+[
+    {
+        "query": "updated_at >= DATEADD(DAY, -7, CURRENT_DATE)",
+        "filter_type": "WHERE",
+        "operator": ">=",
+        "columns": [
+            Column(name="updated_at", potential_tables=["core.accounts"], lineage=None)
+        ],
+    }
+]
+```
+
+`get_filters()` is an alias for `filters()` to match external call-sites.
+
+### `source_tables()`
+
+Returns the ordered list of unique tables referenced by the query (including tables surfaced through CTEs and subqueries):
+
+```python
+>>> parser.source_tables()
+["core.accounts", "analytics.balance_lookup"]
+```
+
 ### Thread Safety
 
 All public QueryParser methods acquire an internal re-entrant lock before populating caches, so you can safely share a single parser instance across threads when building multi-processing pipelines or serving metadata via APIs.

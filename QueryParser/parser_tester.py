@@ -292,7 +292,7 @@ TEST_CASES = [
                 "join_type": "INNER JOIN",
                 "column_left": {
                     "name": "account_id",
-                    "potential_tables": ["CORE.ACCOUNTS", "CORE.ACCOUNT_LOOKUP"],
+                    "potential_tables": ["CORE.ACCOUNTS"],
                 },
                 "column_right": {
                     "name": "account_id",
@@ -425,13 +425,6 @@ TEST_CASES = [
                 "potential_tables": ["COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE"],
             },
             {
-                "name": "COMBINED_ATTRIBUTE",
-                "potential_tables": [
-                    "COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE",
-                    "COMPANY_DB.CUST_SCHEMA.TRANS_TBL",
-                ],
-            },
-            {
                 "name": "CUST_ATTRIBUTE",
                 "potential_tables": ["COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE"],
             },
@@ -460,6 +453,35 @@ TEST_CASES = [
                     "potential_tables": ["COMPANY_DB.CUST_SCHEMA.TRANS_TBL"],
                 },
             }
+        ],
+        "expected_filters": [
+            {
+                "query": "EFF_DT > CAST('2025-01-01' AS DATE)",
+                "filter_type": "WHERE",
+                "operator": ">",
+                "columns": [
+                    {
+                        "name": "EFF_DT",
+                        "potential_tables": [
+                            "COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE"
+                        ],
+                    }
+                ],
+            },
+            {
+                "query": "COMBINED_ATTRIBUTE > 10",
+                "filter_type": "WHERE",
+                "operator": ">",
+                "columns": [
+                    {
+                        "name": "COMBINED_ATTRIBUTE",
+                        "potential_tables": [
+                            "COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE",
+                            "COMPANY_DB.CUST_SCHEMA.TRANS_TBL",
+                        ],
+                    }
+                ],
+            },
         ],
     },
     {
@@ -509,6 +531,17 @@ TEST_CASES = [
                     "name": "ID",
                     "potential_tables": ["TABLE_2"],
                 },
+            }
+        ],
+        "expected_filters": [
+            {
+                "query": "TABLE_1.DT <= TABLE_2.DT",
+                "filter_type": "WHERE",
+                "operator": "<=",
+                "columns": [
+                    {"name": "DT", "potential_tables": ["TABLE_1"]},
+                    {"name": "DT", "potential_tables": ["TABLE_2"]},
+                ],
             }
         ],
     },
@@ -622,6 +655,72 @@ TEST_CASES = [
                 "complex_left": "r.balance + 10",
             }
         ],
+        "expected_filters": [
+            {
+                "query": "updated_at >= DATEADD(DAY, -7, CURRENT_DATE)",
+                "filter_type": "WHERE",
+                "operator": ">=",
+                "columns": [
+                    {
+                        "name": "updated_at",
+                        "potential_tables": ["core.accounts"],
+                    }
+                ],
+            }
+        ],
+    },
+    {
+        "name": "summed_field_lineage",
+        "query": """
+        SELECT
+            SUMMED_FIELD
+        FROM
+            (SELECT
+                a.A + b.B AS SUMMED_FIELD
+            FROM
+                MYDB.MYSCHEMA.TABLE_A a
+            JOIN
+                MYDB.MYSCHEMA.TABLE_B b
+            ON a.ID = b.ID
+            )
+        WHERE
+            SUMMED_FIELD > 10;
+        """,
+        "expected_columns": [
+            {"name": "A", "potential_tables": ["MYDB.MYSCHEMA.TABLE_A"]},
+            {"name": "B", "potential_tables": ["MYDB.MYSCHEMA.TABLE_B"]},
+            {"name": "ID", "potential_tables": ["MYDB.MYSCHEMA.TABLE_A"]},
+            {"name": "ID", "potential_tables": ["MYDB.MYSCHEMA.TABLE_B"]},
+        ],
+        "expected_joins": [
+            {
+                "join_type": "INNER JOIN",
+                "column_left": {
+                    "name": "ID",
+                    "potential_tables": ["MYDB.MYSCHEMA.TABLE_A"],
+                },
+                "column_right": {
+                    "name": "ID",
+                    "potential_tables": ["MYDB.MYSCHEMA.TABLE_B"],
+                },
+            }
+        ],
+        "expected_filters": [
+            {
+                "query": "SUMMED_FIELD > 10",
+                "filter_type": "WHERE",
+                "operator": ">",
+                "columns": [
+                    {
+                        "name": "SUMMED_FIELD",
+                        "potential_tables": [
+                            "MYDB.MYSCHEMA.TABLE_A",
+                            "MYDB.MYSCHEMA.TABLE_B",
+                        ],
+                    }
+                ],
+            }
+        ],
     },
 ]
 
@@ -678,6 +777,45 @@ class QueryParserTests(unittest.TestCase):
             ),
         )
 
+    def _normalize_filter_column(self, column):
+        if hasattr(column, "col_name"):
+            name = column.col_name
+            tables = sorted(column.potential_tables)
+        else:
+            name = column["name"]
+            tables = sorted(column["potential_tables"])
+        return {"name": name, "potential_tables": tables}
+
+    def _normalize_filters(self, filters):
+        normalized = []
+        for entry in filters:
+            normalized_entry = {
+                "query": entry["query"],
+                "filter_type": entry["filter_type"],
+                "operator": entry["operator"],
+                "columns": [
+                    self._normalize_filter_column(column)
+                    for column in entry["columns"]
+                ],
+            }
+            normalized_entry["columns"].sort(
+                key=lambda col: (col["name"], tuple(col["potential_tables"]))
+            )
+            normalized.append(normalized_entry)
+
+        return sorted(
+            normalized,
+            key=lambda item: (
+                item["filter_type"],
+                item["operator"],
+                item["query"],
+                tuple(
+                    (col["name"], tuple(col["potential_tables"]))
+                    for col in item["columns"]
+                ),
+            ),
+        )
+
     def test_queries_against_expectations(self):
         for case in TEST_CASES:
             with self.subTest(case=case["name"]):
@@ -697,6 +835,28 @@ class QueryParserTests(unittest.TestCase):
                     actual_joins,
                     f"Join mismatch for case {case['name']}",
                 )
+
+                if "expected_filters" in case:
+                    expected_filters = self._normalize_filters(case["expected_filters"])
+                    actual_filters = self._normalize_filters(parser.filters())
+                    self.assertEqual(
+                        expected_filters,
+                        actual_filters,
+                        f"Filter mismatch for case {case['name']}",
+                    )
+
+    def test_source_tables(self):
+        query = """
+        SELECT *
+        FROM CORE.ACCOUNTS a
+        JOIN CORE.ACCOUNT_LOOKUP b ON a.ID = b.ID
+        LEFT JOIN analytics.balance_lookup c ON b.ID = c.ID
+        """
+        parser = QueryParser(query)
+        self.assertEqual(
+            ["CORE.ACCOUNTS", "CORE.ACCOUNT_LOOKUP", "analytics.balance_lookup"],
+            parser.source_tables(),
+        )
 
 
 if __name__ == "__main__":
