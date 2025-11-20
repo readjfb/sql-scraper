@@ -741,6 +741,146 @@ TEST_CASES = [
         ],
         "expected_joins": [],
     },
+    {
+        "name": "aggregate_alias_in_having",
+        "query": """
+        SELECT
+            A_CNT, COUNT(EP_ID) CUST_CNT
+        FROM (
+            SELECT
+                EP_ID, COUNT(DISTINCT ADN) A_CNT
+            FROM
+                MYDB.MYSCHEMA.MYTABLE
+            WHERE END_DT > dateadd(month, -6, current_date )
+            GROUP BY 1
+            HAVING A_CNT > 2
+        )
+        GROUP BY 1
+        """,
+        "expected_columns": [
+            {"name": "ADN", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"]},
+            {"name": "EP_ID", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"]},
+            {"name": "END_DT", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"]},
+        ],
+        "expected_joins": [],
+        "expected_filters": [
+            {
+                "query": "END_DT > DATEADD(MONTH, -6, CURRENT_DATE)",
+                "filter_type": "WHERE",
+                "operator": ">",
+                "columns": [
+                    {"name": "END_DT", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"]}
+                ],
+            },
+            {
+                "query": "A_CNT > 2",
+                "filter_type": "HAVING",
+                "operator": ">",
+                "columns": [
+                    {"name": "A_CNT", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"]}
+                ],
+            },
+        ],
+        "expected_filter_lineage": [
+            {
+                "query": "A_CNT > 2",
+                "column": {
+                    "name": "A_CNT",
+                    "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"],
+                },
+                "depends_on": [
+                    {"name": "ADN", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"]}
+                ],
+            }
+        ],
+    },
+    {
+        "name": "filter_operator_variety",
+        "query": """
+        SELECT
+            customer_id,
+            SUM(balance) AS total_balance
+        FROM analytics.sales s
+        WHERE status IN ('A','B')
+          AND balance BETWEEN 10 AND 20
+          AND promo_code LIKE 'NY%'
+          AND deleted IS NULL
+          AND EXISTS (
+                SELECT 1
+                FROM analytics.audit a
+                WHERE a.customer_id = s.customer_id
+            )
+        GROUP BY 1
+        HAVING COUNT(*) > 1
+        """,
+        "expected_columns": [
+            {"name": "customer_id", "potential_tables": ["analytics.sales"]},
+            {"name": "customer_id", "potential_tables": ["analytics.audit"]},
+            {"name": "balance", "potential_tables": ["analytics.sales"]},
+            {"name": "deleted", "potential_tables": ["analytics.sales"]},
+            {"name": "promo_code", "potential_tables": ["analytics.sales"]},
+            {"name": "status", "potential_tables": ["analytics.sales"]},
+        ],
+        "expected_joins": [],
+        "expected_filters": [
+            {
+                "query": "status IN ('A', 'B')",
+                "filter_type": "WHERE",
+                "operator": "IN",
+                "columns": [
+                    {"name": "status", "potential_tables": ["analytics.sales"]}
+                ],
+            },
+            {
+                "query": "balance BETWEEN 10 AND 20",
+                "filter_type": "WHERE",
+                "operator": "BETWEEN",
+                "columns": [
+                    {"name": "balance", "potential_tables": ["analytics.sales"]}
+                ],
+            },
+            {
+                "query": "promo_code LIKE 'NY%'",
+                "filter_type": "WHERE",
+                "operator": "LIKE",
+                "columns": [
+                    {"name": "promo_code", "potential_tables": ["analytics.sales"]}
+                ],
+            },
+            {
+                "query": "deleted IS NULL",
+                "filter_type": "WHERE",
+                "operator": "IS",
+                "columns": [
+                    {"name": "deleted", "potential_tables": ["analytics.sales"]}
+                ],
+            },
+            {
+                "query": "EXISTS(SELECT 1 FROM analytics.audit AS a WHERE a.customer_id = s.customer_id)",
+                "filter_type": "WHERE",
+                "operator": "EXISTS",
+                "columns": [
+                    {"name": "customer_id", "potential_tables": ["analytics.audit"]},
+                    {"name": "customer_id", "potential_tables": ["analytics.sales"]},
+                ],
+            },
+            {
+                "query": "COUNT(*) > 1",
+                "filter_type": "HAVING",
+                "operator": ">",
+                "columns": [],
+            },
+            {
+                "query": "a.customer_id = s.customer_id",
+                "filter_type": "WHERE",
+                "operator": "=",
+                "columns": [
+                    {"name": "customer_id", "potential_tables": ["analytics.audit"]},
+                    {"name": "customer_id", "potential_tables": ["analytics.sales"]},
+                ],
+            },
+        ],
+    },
 ]
 
 
@@ -796,6 +936,26 @@ class QueryParserTests(unittest.TestCase):
             ),
         )
 
+    def _normalize_lineage_columns(self, lineage):
+        normalized = []
+        for column in lineage or []:
+            entry = {
+                "name": column.col_name,
+                "potential_tables": sorted(column.potential_tables),
+            }
+            nested = self._normalize_lineage_columns(column.lineage)
+            if nested:
+                entry["lineage"] = nested
+            normalized.append(entry)
+        return sorted(
+            normalized,
+            key=lambda col: (
+                col["name"],
+                tuple(col["potential_tables"]),
+                tuple(col.get("lineage") or []),
+            ),
+        )
+
     def _normalize_filter_column(self, column):
         if hasattr(column, "col_name"):
             name = column.col_name
@@ -839,6 +999,7 @@ class QueryParserTests(unittest.TestCase):
         for case in TEST_CASES:
             with self.subTest(case=case["name"]):
                 parser = QueryParser(case["query"])
+                raw_filters = parser.filters()
                 expected_columns = self._normalize_columns(case["expected_columns"])
                 actual_columns = self._normalize_columns(parser.feature_columns())
                 self.assertEqual(
@@ -857,12 +1018,52 @@ class QueryParserTests(unittest.TestCase):
 
                 if "expected_filters" in case:
                     expected_filters = self._normalize_filters(case["expected_filters"])
-                    actual_filters = self._normalize_filters(parser.filters())
+                    actual_filters = self._normalize_filters(raw_filters)
                     self.assertEqual(
                         expected_filters,
                         actual_filters,
                         f"Filter mismatch for case {case['name']}",
                     )
+
+                if "expected_filter_lineage" in case:
+                    filter_lookup = {entry["query"]: entry for entry in raw_filters}
+                    for expectation in case["expected_filter_lineage"]:
+                        target_filter = filter_lookup.get(expectation["query"])
+                        self.assertIsNotNone(
+                            target_filter,
+                            f"Missing filter for lineage assertion: {expectation['query']}",
+                        )
+                        column_spec = expectation["column"]
+                        target_column = None
+                        for column in target_filter["columns"]:
+                            if (
+                                column.col_name == column_spec["name"]
+                                and sorted(column.potential_tables)
+                                == sorted(column_spec["potential_tables"])
+                            ):
+                                target_column = column
+                                break
+                        self.assertIsNotNone(
+                            target_column,
+                            f"Missing column {column_spec['name']} in filter {expectation['query']}",
+                        )
+                        actual_lineage = [
+                            {
+                                "name": entry["name"],
+                                "potential_tables": entry["potential_tables"],
+                            }
+                            for entry in self._normalize_lineage_columns(
+                                target_column.lineage
+                            )
+                        ]
+                        expected_lineage = self._normalize_columns(
+                            expectation["depends_on"]
+                        )
+                        self.assertEqual(
+                            expected_lineage,
+                            actual_lineage,
+                            f"Filter lineage mismatch for column {column_spec['name']} in case {case['name']}",
+                        )
 
     def test_source_tables(self):
         query = """
@@ -876,6 +1077,86 @@ class QueryParserTests(unittest.TestCase):
             ["CORE.ACCOUNTS", "CORE.ACCOUNT_LOOKUP", "analytics.balance_lookup"],
             parser.source_tables(),
         )
+
+    def test_subquery_star_lineage_and_source_columns(self):
+        query = """
+        SELECT outer_alias.*
+        FROM (
+            SELECT
+                ID,
+                AMOUNT,
+                AMOUNT * 2 AS DOUBLED
+            FROM SALES_DB.PUBLIC.TABLE_A
+        ) outer_alias
+        """
+        parser = QueryParser(query)
+        expected_columns = self._normalize_columns(
+            [
+                {"name": "ID", "potential_tables": ["SALES_DB.PUBLIC.TABLE_A"]},
+                {"name": "AMOUNT", "potential_tables": ["SALES_DB.PUBLIC.TABLE_A"]},
+            ]
+        )
+        actual_columns = self._normalize_columns(parser.feature_columns())
+        self.assertEqual(expected_columns, actual_columns)
+
+        lineage = parser.column_lineage()
+        self.assertIn("outer_alias", lineage)
+        self.assertEqual(
+            {
+                "ID": ["SALES_DB.PUBLIC.TABLE_A"],
+                "AMOUNT": ["SALES_DB.PUBLIC.TABLE_A"],
+                "DOUBLED": ["SALES_DB.PUBLIC.TABLE_A"],
+            },
+            lineage["outer_alias"],
+        )
+
+    def test_nested_filter_lineage_preserved(self):
+        query = """
+        WITH base AS (
+            SELECT amount FROM sales.orders
+        ),
+        cte AS (
+            SELECT amount AS inner_amount FROM base
+        ),
+        final AS (
+            SELECT inner_amount AS outer_amount FROM cte
+        )
+        SELECT outer_amount
+        FROM final
+        HAVING outer_amount > 10
+        """
+        parser = QueryParser(query)
+        target_filter = next(
+            entry
+            for entry in parser.filters()
+            if entry["query"] == "outer_amount > 10"
+        )
+        target_column = next(
+            column
+            for column in target_filter["columns"]
+            if column.col_name == "outer_amount"
+        )
+        normalized_lineage = self._normalize_lineage_columns(target_column.lineage)
+        names = {entry["name"] for entry in normalized_lineage}
+        self.assertIn("inner_amount", names)
+        inner_entry = next(
+            entry for entry in normalized_lineage if entry["name"] == "inner_amount"
+        )
+        inner_dependencies = inner_entry.get("lineage") or []
+        self.assertTrue(
+            any(child.get("name") == "amount" for child in inner_dependencies),
+            "inner_amount should depend on base amount column",
+        )
+        outer_entry = next(
+            (entry for entry in normalized_lineage if entry["name"] == "outer_amount"),
+            None,
+        )
+        if outer_entry:
+            outer_dependencies = outer_entry.get("lineage") or []
+            self.assertTrue(
+                any(child.get("name") == "inner_amount" for child in outer_dependencies),
+                "outer_amount should depend on inner_amount",
+            )
 
 
 if __name__ == "__main__":

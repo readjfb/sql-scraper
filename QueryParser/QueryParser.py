@@ -227,16 +227,17 @@ class QueryParser:
                 column_name,
             )
             if lineage_entries:
-                lineage_columns = self._build_lineage_columns(lineage_entries)
-                for lineage_column in lineage_columns:
-                    key = (
-                        lineage_column.col_name.lower(),
-                        tuple(lineage_column.potential_tables),
-                    )
+                normalized_entries = self._lineage_leaf_entries(lineage_entries)
+                for entry in normalized_entries:
+                    name = entry.get("name")
+                    tables = entry.get("tables", [])
+                    if not name or not tables:
+                        continue
+                    key = (name.lower(), tuple(tables))
                     if key in seen:
                         continue
                     seen.add(key)
-                    result.append(lineage_column)
+                    result.append(Column(col_name=name, potential_tables=list(tables)))
                 continue
             key = (column_name.lower(), tuple(potential_tables))
             if key in seen:
@@ -247,7 +248,8 @@ class QueryParser:
                 Column(col_name=column_name, potential_tables=potential_tables)
             )
 
-        return self._filter_redundant_ambiguity(result)
+        physical_columns = [column for column in result if not column.lineage]
+        return self._filter_redundant_ambiguity(physical_columns)
 
     def _expand_star_column(
         self, column: exp.Column, select_context: dict
@@ -260,12 +262,26 @@ class QueryParser:
         for relation in targets:
             for entry in (relation.get("columns") or {}).values():
                 name = entry.get("name")
-                tables = entry.get("tables", [])
-                if entry.get("lineage"):
+                if not name:
                     continue
-                if not name or not tables:
+                tables = list(entry.get("tables") or [])
+                lineage_leaves = self._lineage_leaf_entries(entry.get("lineage"))
+                if lineage_leaves:
+                    for component in lineage_leaves:
+                        component_name = component.get("name")
+                        component_tables = component.get("tables", [])
+                        if not component_name or not component_tables:
+                            continue
+                        expanded.append(
+                            Column(
+                                col_name=component_name,
+                                potential_tables=list(component_tables),
+                            )
+                        )
                     continue
-                expanded.append(Column(col_name=name, potential_tables=list(tables)))
+                if not tables:
+                    continue
+                expanded.append(Column(col_name=name, potential_tables=tables))
         return expanded
 
     def _resolve_column_sources(
@@ -465,22 +481,16 @@ class QueryParser:
         self, column: exp.Column, select_context: Optional[dict]
     ) -> Optional[Column]:
         """Build a Column with lineage information for a filter expression."""
-        column_name = column.name
-        if not column_name:
+        column_obj = self._column_from_expression(column, select_context)
+        if column_obj is None:
             return None
 
-        potential_tables = self._resolve_column_sources(
-            column.table, select_context, column_name
-        )
         lineage_entries = self._column_lineage_for_reference(
-            column.table, select_context, column_name
+            column.table, select_context, column.name
         )
         lineage_columns = self._build_lineage_columns(lineage_entries)
-        return Column(
-            col_name=column_name,
-            potential_tables=potential_tables,
-            lineage=lineage_columns or None,
-        )
+        column_obj.lineage = lineage_columns or None
+        return column_obj
 
     def _format_lineage_map(
         self, lineage: Dict[str, Dict[str, List[str]]]
@@ -632,8 +642,8 @@ class QueryParser:
         condition: Optional[exp.Expression],
         left_sources: List[str],
         right_sources: List[str],
-    ) -> List[Tuple[Optional[Column], Optional[Column]]]:
-        """Extract column pairs from ON clauses, correcting orientation as needed."""
+    ) -> List[dict]:
+        """Extract column pair metadata for ON clauses, correcting orientation."""
         result: List[dict] = []
         left_source_set = set(left_sources)
         right_source_set = set(right_sources)
@@ -683,9 +693,12 @@ class QueryParser:
     def _flatten_conditions(
         self, condition: Optional[exp.Expression]
     ) -> List[exp.Expression]:
-        """Flatten nested AND/OR trees into a list of comparison expressions."""
+        """Flatten nested logical trees while preserving arbitrary predicates."""
         if condition is None:
             return []
+
+        if isinstance(condition, exp.Paren):
+            return self._flatten_conditions(condition.this)
 
         logical_types = (exp.And, exp.Or)
         if isinstance(condition, logical_types):
@@ -695,11 +708,7 @@ class QueryParser:
             )
             return left_conditions + right_conditions
 
-        comparator_types = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE)
-        if isinstance(condition, comparator_types):
-            return [condition]
-
-        return []
+        return [condition]
 
     def _columns_from_using(
         self,
@@ -881,7 +890,26 @@ class QueryParser:
                     default_tables, descriptor["tables"]
                 )
 
-        return {"relations": relations, "default_tables": default_tables}
+        projection_lineage: Dict[str, Dict[str, Any]] = {}
+        projection_context = {"relations": relations, "default_tables": default_tables}
+        for projection in select.expressions or []:
+            output_name = self._output_column_name(projection)
+            if not output_name:
+                continue
+            tables = self._tables_for_projection(projection, projection_context)
+            projection_dependencies = self._projection_lineage(
+                projection, projection_context
+            )
+            if projection_dependencies:
+                projection_lineage[output_name.lower()] = {
+                    "lineage": projection_dependencies
+                }
+
+        return {
+            "relations": relations,
+            "default_tables": default_tables,
+            "projection_lineage": projection_lineage,
+        }
 
     def _relation_descriptor(
         self,
@@ -1051,16 +1079,16 @@ class QueryParser:
                 columns = relation.get("columns") or {}
                 extend_from_entry(columns.get(column_key))
 
-            qualifier_variants = [qualifier, qualifier.lower(), qualifier.upper()]
-            for alias in qualifier_variants:
-                alias_lineage = self._alias_column_lineage.get(alias.lower())
-                if alias_lineage:
-                    extend_from_entry(alias_lineage.get(column_key))
+            alias_lineage = self._alias_column_lineage.get(qualifier.lower())
+            if alias_lineage:
+                extend_from_entry(alias_lineage.get(column_key))
             return matches
 
         for relation in select_context.get("relations", []):
             columns = relation.get("columns") or {}
             extend_from_entry(columns.get(column_key))
+        projection_lineage = select_context.get("projection_lineage", {})
+        extend_from_entry(projection_lineage.get(column_key))
         return matches
 
     def _build_lineage_columns(
@@ -1105,9 +1133,28 @@ class QueryParser:
             else:
                 continue
             if not name:
+                if nested:
+                    normalized.extend(nested)
                 continue
             normalized_entry: Dict[str, Any] = {"name": name, "tables": tables}
             if nested:
                 normalized_entry["lineage"] = nested
             normalized.append(normalized_entry)
         return normalized
+
+    def _lineage_leaf_entries(
+        self, entries: Optional[List[Any]]
+    ) -> List[Dict[str, Any]]:
+        """Return only terminal lineage entries with concrete table mappings."""
+        leaves: List[Dict[str, Any]] = []
+        for entry in self._normalize_lineage_entries(entries):
+            nested = entry.get("lineage")
+            if nested:
+                leaves.extend(self._lineage_leaf_entries(nested))
+                continue
+            name = entry.get("name")
+            tables = list(entry.get("tables") or [])
+            if not name or not tables:
+                continue
+            leaves.append({"name": name, "tables": tables})
+        return leaves
