@@ -29,6 +29,7 @@ class QueryParser:
         self._alias_to_table, self._source_tables = self._collect_tables()
         self._select_context_cache: Dict[int, dict] = {}
         self._source_columns: Optional[List[Column]] = None
+        self._select_columns: Optional[List[dict]] = None
         self._joins: Optional[List[dict]] = None
         self._filters: Optional[List[dict]] = None
         self._lock = RLock()
@@ -42,6 +43,13 @@ class QueryParser:
             if self._source_columns is None:
                 self._source_columns = self._extract_source_columns()
             return self._source_columns
+
+    def select_columns(self) -> List[dict]:
+        """Return columns that surface in the SELECT list with direct/derived flags."""
+        with self._lock:
+            if self._select_columns is None:
+                self._select_columns = self._extract_select_columns()
+            return self._select_columns
 
     def joins(self) -> List[dict]:
         """
@@ -250,6 +258,94 @@ class QueryParser:
 
         physical_columns = [column for column in result if not column.lineage]
         return self._filter_redundant_ambiguity(physical_columns)
+
+    def _extract_select_columns(self) -> List[dict]:
+        """Collect source columns used by output projections."""
+        entries: Dict[tuple[str, tuple[str, ...]], dict] = {}
+        for select in self._final_selects(self._expression):
+            context = self._select_context(select)
+            for projection in select.expressions or []:
+                for column, direct in self._projection_columns(projection, context):
+                    if column is None:
+                        continue
+                    key = (column.col_name.lower(), tuple(column.potential_tables))
+                    existing = entries.get(key)
+                    if existing:
+                        existing["direct"] = existing["direct"] or direct
+                    else:
+                        entries[key] = {"column": column, "direct": direct}
+        return list(entries.values())
+
+    def _final_selects(self, expression: Optional[exp.Expression]) -> List[exp.Select]:
+        """Return SELECT nodes that produce the query output."""
+        if expression is None:
+            return []
+        if isinstance(expression, exp.With):
+            return self._final_selects(expression.this)
+        if isinstance(expression, exp.Subquery):
+            return self._final_selects(expression.this)
+        if isinstance(expression, exp.Paren):
+            return self._final_selects(expression.this)
+        if isinstance(expression, exp.SetOperation):
+            left = self._final_selects(expression.this)
+            right = self._final_selects(expression.args.get("expression"))
+            return left + right
+        return [expression] if isinstance(expression, exp.Select) else []
+
+    def _projection_columns(
+        self, projection: exp.Expression, context: dict
+    ) -> List[tuple[Column, bool]]:
+        """Return (Column, direct) pairs feeding a SELECT projection."""
+        target = projection.this if isinstance(projection, exp.Alias) else projection
+        if isinstance(target, exp.Column):
+            return self._column_projection(target, context)
+
+        dependencies = self._projection_lineage(projection, context)
+        return self._lineage_columns(dependencies, allow_direct=False)
+
+    def _column_projection(
+        self, column: exp.Column, context: dict
+    ) -> List[tuple[Column, bool]]:
+        """Handle projection columns, expanding stars and lineage."""
+        if column.name == "*":
+            return self._star_projection(column, context)
+
+        lineage_entries = self._column_lineage_for_reference(
+            column.table, context, column.name
+        )
+        if lineage_entries:
+            return self._lineage_columns(lineage_entries, allow_direct=True)
+
+        column_obj = self._column_from_expression(column, context)
+        return [(column_obj, True)] if column_obj else []
+
+    def _star_projection(
+        self, column: exp.Column, context: dict
+    ) -> List[tuple[Column, bool]]:
+        """Return column mappings for ``*`` projections."""
+        columns: List[tuple[Column, bool]] = []
+        for relation in self._relations_for_qualifier(context, column.table):
+            for entry in (relation.get("columns") or {}).values():
+                columns.extend(
+                    self._lineage_columns([entry], allow_direct=True)
+                )
+        return columns
+
+    def _lineage_columns(
+        self, entries: Optional[List[Any]], allow_direct: bool
+    ) -> List[tuple[Column, bool]]:
+        """Convert lineage-style entries into Column objects with direct flags."""
+        leaves = self._lineage_leaf_entries(entries)
+        columns: List[Column] = []
+        for leaf in leaves:
+            name = leaf.get("name")
+            tables = list(leaf.get("tables") or [])
+            if not name or not tables:
+                continue
+            columns.append(Column(col_name=name, potential_tables=tables))
+
+        direct = allow_direct and len(columns) == 1
+        return [(column, direct) for column in columns]
 
     def _expand_star_column(
         self, column: exp.Column, select_context: dict

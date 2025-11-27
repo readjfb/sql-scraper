@@ -995,6 +995,22 @@ class QueryParserTests(unittest.TestCase):
             ),
         )
 
+    def _normalize_select_columns(self, columns):
+        normalized = []
+        for entry in columns:
+            column = entry["column"]
+            normalized.append(
+                {
+                    "name": column.col_name,
+                    "potential_tables": sorted(column.potential_tables),
+                    "direct": entry["direct"],
+                }
+            )
+        return sorted(
+            normalized,
+            key=lambda col: (col["name"], tuple(col["potential_tables"]), col["direct"]),
+        )
+
     def test_queries_against_expectations(self):
         for case in TEST_CASES:
             with self.subTest(case=case["name"]):
@@ -1157,6 +1173,61 @@ class QueryParserTests(unittest.TestCase):
                 any(child.get("name") == "inner_amount" for child in outer_dependencies),
                 "outer_amount should depend on inner_amount",
             )
+
+    def test_select_columns_direct_and_expression_lineage(self):
+        direct_query = """
+        SELECT
+            A,
+            B
+        FROM TABLE_B
+        WHERE C > 10
+        """
+        parser = QueryParser(direct_query)
+        direct_columns = self._normalize_select_columns(parser.select_columns())
+        self.assertEqual(
+            [
+                {"name": "A", "potential_tables": ["TABLE_B"], "direct": True},
+                {"name": "B", "potential_tables": ["TABLE_B"], "direct": True},
+            ],
+            direct_columns,
+        )
+
+        derived_query = """
+        SELECT
+            A + B AS D
+        FROM TABLE_B
+        WHERE C > 10
+        """
+        parser = QueryParser(derived_query)
+        derived_columns = self._normalize_select_columns(parser.select_columns())
+        self.assertEqual(
+            [
+                {"name": "A", "potential_tables": ["TABLE_B"], "direct": False},
+                {"name": "B", "potential_tables": ["TABLE_B"], "direct": False},
+            ],
+            derived_columns,
+        )
+
+    def test_select_columns_cte_lineage_is_flattened(self):
+        query = """
+        WITH base AS (
+            SELECT
+                a,
+                b,
+                a + b AS sum_ab
+            FROM TABLE_C
+        )
+        SELECT sum_ab FROM base
+        """
+        parser = QueryParser(query)
+        columns = self._normalize_select_columns(parser.select_columns())
+        self.assertEqual(
+            [
+                {"name": "a", "potential_tables": ["TABLE_C"], "direct": False},
+                {"name": "b", "potential_tables": ["TABLE_C"], "direct": False},
+            ],
+            columns,
+        )
 
 
 if __name__ == "__main__":
