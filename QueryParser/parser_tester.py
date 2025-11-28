@@ -481,6 +481,13 @@ TEST_CASES = [
                 ],
             },
         ],
+        "expected_filter_columns": [
+            {
+                "name": "EFF_DT",
+                "potential_tables": ["COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE"],
+                "direct": True,
+            }
+        ],
     },
     {
         "name": "include_unused_column_query",
@@ -669,6 +676,9 @@ TEST_CASES = [
                 ],
             }
         ],
+        "expected_filter_columns": [
+            {"name": "updated_at", "potential_tables": ["core.accounts"], "direct": True}
+        ],
     },
     {
         "name": "summed_field_lineage",
@@ -722,6 +732,7 @@ TEST_CASES = [
                 ],
             }
         ],
+        "expected_filter_columns": [],
     },
     {
         "name": "subquery_with_group_by",
@@ -793,6 +804,9 @@ TEST_CASES = [
                     {"name": "ADN", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"]}
                 ],
             }
+        ],
+        "expected_filter_columns": [
+            {"name": "END_DT", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE"], "direct": True}
         ],
     },
     {
@@ -880,6 +894,14 @@ TEST_CASES = [
                     {"name": "customer_id", "potential_tables": ["analytics.sales"]},
                 ],
             },
+        ],
+        "expected_filter_columns": [
+            {"name": "status", "potential_tables": ["analytics.sales"], "direct": True},
+            {"name": "balance", "potential_tables": ["analytics.sales"], "direct": True},
+            {"name": "promo_code", "potential_tables": ["analytics.sales"], "direct": True},
+            {"name": "deleted", "potential_tables": ["analytics.sales"], "direct": True},
+            {"name": "customer_id", "potential_tables": ["analytics.audit"], "direct": True},
+            {"name": "customer_id", "potential_tables": ["analytics.sales"], "direct": True},
         ],
     },
 ]
@@ -995,6 +1017,27 @@ class QueryParserTests(unittest.TestCase):
             ),
         )
 
+    def _normalize_filter_columns(self, columns):
+        normalized = []
+        for column in columns:
+            if hasattr(column, "col_name"):
+                name = column.col_name
+                tables = sorted(column.potential_tables)
+                direct = not bool(column.lineage)
+            else:
+                name = column["name"]
+                tables = sorted(column["potential_tables"])
+                direct = column.get("direct", True)
+            normalized.append({"name": name, "potential_tables": tables, "direct": direct})
+        return sorted(
+            normalized,
+            key=lambda col: (
+                col["name"],
+                tuple(col["potential_tables"]),
+                col["direct"],
+            ),
+        )
+
     def _normalize_select_columns(self, columns):
         normalized = []
         for entry in columns:
@@ -1082,6 +1125,19 @@ class QueryParserTests(unittest.TestCase):
                             actual_lineage,
                             f"Filter lineage mismatch for column {column_spec['name']} in case {case['name']}",
                         )
+
+                if "expected_filter_columns" in case:
+                    expected_filter_columns = self._normalize_filter_columns(
+                        case["expected_filter_columns"]
+                    )
+                    actual_filter_columns = self._normalize_filter_columns(
+                        parser.filter_columns()
+                    )
+                    self.assertEqual(
+                        expected_filter_columns,
+                        actual_filter_columns,
+                        f"Filter columns mismatch for case {case['name']}",
+                    )
 
     def test_source_tables(self):
         query = """
@@ -1231,6 +1287,33 @@ class QueryParserTests(unittest.TestCase):
             ],
             columns,
         )
+
+    def test_filter_columns_direct_and_derived(self):
+        query = """
+        SELECT * FROM (
+            SELECT
+                A,
+                A + B AS SUMMED
+            FROM T1
+        )
+        WHERE A > B AND SUMMED > 10
+        """
+        parser = QueryParser(query)
+        direct_only = parser.filter_columns()
+        all_columns = parser.filter_columns(return_only_direct=False)
+
+        direct = self._normalize_filter_columns(direct_only)
+        expected_direct = [
+            {"name": "A", "potential_tables": ["T1"], "direct": True},
+            {"name": "B", "potential_tables": ["T1"], "direct": True},
+        ]
+        self.assertEqual(expected_direct, direct)
+
+        all_normalized = self._normalize_filter_columns(all_columns)
+        expected_all = expected_direct + [
+            {"name": "SUMMED", "potential_tables": ["T1"], "direct": False}
+        ]
+        self.assertEqual(expected_all, all_normalized)
 
     def test_set_operation_lineage_preserved(self):
         query = """

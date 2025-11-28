@@ -126,6 +126,17 @@ Surfaces every `WHERE`/`HAVING` comparator in the query. Each entry includes the
 
 `get_filters()` is an alias for `filters()` to match external call-sites.
 
+### `filter_columns(return_only_direct=True)`
+
+Returns the columns referenced in all filter predicates. When `return_only_direct` is `True`, only columns that map 1:1 to a physical source (no expressions) are returned; set to `False` to include derived columns as well.
+
+```python
+>>> QueryParser("SELECT *, A + B AS SUMMED FROM t WHERE A > B AND SUMMED > 0").filter_columns()
+[Column(name="A", potential_tables=["t"]), Column(name="B", potential_tables=["t"])]
+>>> QueryParser("SELECT *, A + B AS SUMMED FROM t WHERE A > B AND SUMMED > 0").filter_columns(return_only_direct=False)
+[Column(name="A", potential_tables=["t"]), Column(name="B", potential_tables=["t"]), Column(name="SUMMED", potential_tables=["t"])]
+```
+
 ### `source_tables()`
 
 Returns the ordered list of unique tables referenced by the query (including tables surfaced through CTEs and subqueries):

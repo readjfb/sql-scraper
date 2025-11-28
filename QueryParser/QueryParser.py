@@ -85,6 +85,29 @@ class QueryParser:
         """Alias for ``filters`` to align with external call sites."""
         return self.filters()
 
+    def filter_columns(self, return_only_direct: bool = True) -> List[Column]:
+        """
+        Return columns used across all filter predicates.
+        When ``return_only_direct`` is True, only include columns that map 1:1 to a
+        physical source (no expressions). Otherwise include derived columns too.
+        """
+        columns: List[Column] = []
+        seen: set[tuple[str, tuple[str, ...], bool]] = set()
+        for entry in self.filters():
+            for column in self._filter_columns_with_direct_flag(
+                entry, return_only_direct
+            ):
+                key = (
+                    column.col_name.lower(),
+                    tuple(column.potential_tables),
+                    bool(column.lineage),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                columns.append(column)
+        return columns
+
     def feature_columns(self) -> List[dict]:
         """
         Return Feature 1 in dict form:
@@ -579,6 +602,43 @@ class QueryParser:
             columns.append(column)
         return columns
 
+    def _filter_columns_with_direct_flag(
+        self, filter_entry: dict, return_only_direct: bool
+    ) -> List[Column]:
+        """
+        Return columns from a filter entry with lineage retained to mark directness.
+        A column is direct when it has no lineage or when its lineage resolves to a
+        single physical column in one table (including simple alias passthroughs).
+        """
+        result: List[Column] = []
+        for column in filter_entry.get("columns", []):
+            direct = not column.lineage
+            if not direct and column.lineage:
+                leaves = self._lineage_leaf_entries(column.lineage)
+                # Direct if lineage collapses to a single physical column in one table.
+                if (
+                    len(leaves) == 1
+                    and len(leaves[0].get("tables", [])) == 1
+                    and (leaves[0].get("name") or "").lower()
+                    == column.col_name.lower()
+                ):
+                    direct = True
+                    column.lineage = None
+                # Also direct if lineage is just a passthrough of the same column.
+                elif (
+                    len(column.lineage) == 1
+                    and not column.lineage[0].lineage
+                    and column.lineage[0].col_name.lower()
+                    == column.col_name.lower()
+                    and sorted(column.lineage[0].potential_tables)
+                    == sorted(column.potential_tables)
+                ):
+                    direct = True
+                    column.lineage = None
+            if direct or not return_only_direct:
+                result.append(column)
+        return result
+
     def _format_filter_operator(self, comparator: exp.Expression) -> str:
         """Return a human-readable operator string for a comparator expression."""
         operator_map = {
@@ -625,6 +685,27 @@ class QueryParser:
         )
         lineage_columns = self._build_lineage_columns(lineage_entries)
         column_obj.lineage = lineage_columns or None
+        # If lineage exists, prefer the most concrete leaf tables for provenance.
+        if lineage_columns:
+            leaves = self._lineage_leaf_entries(lineage_entries)
+            merged_tables = []
+            for leaf in leaves:
+                merged_tables = self._merge_sources(
+                    merged_tables, list(leaf.get("tables") or [])
+                )
+            if merged_tables:
+                column_obj.potential_tables = merged_tables
+            # Do not keep redundant self-referential lineage (e.g., alias passthrough).
+            filtered_lineage = []
+            for entry in lineage_columns:
+                if (
+                    entry.col_name.lower() == column_obj.col_name.lower()
+                    and entry.potential_tables == column_obj.potential_tables
+                    and not entry.lineage
+                ):
+                    continue
+                filtered_lineage.append(entry)
+            column_obj.lineage = filtered_lineage or None
         return column_obj
 
     def _format_lineage_map(
