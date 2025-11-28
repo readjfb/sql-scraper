@@ -61,6 +61,19 @@ parser = QueryParser(sql, dialect="snowflake")
 ]
 ```
 
+### `select_columns()`
+
+Returns the columns that appear in the final `SELECT` list, flattened to their physical sources. Each entry is `{"column": Column, "direct": bool}` where `direct` is `True` only when the output column maps 1:1 to a source column.
+
+```python
+>>> QueryParser("SELECT A, A + B AS sum_ab FROM T").select_columns()
+[
+    {"column": Column(name="A", potential_tables=["T"], lineage=None), "direct": True},
+    {"column": Column(name="A", potential_tables=["T"], lineage=None), "direct": False},
+    {"column": Column(name="B", potential_tables=["T"], lineage=None), "direct": False},
+]
+```
+
 ### `joins()`
 
 Returns dictionaries describing each join encountered. Fields:

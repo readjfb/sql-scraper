@@ -18,6 +18,11 @@ class QueryParser:
         self.query = query
         self._dialect = dialect
         self._expression = sqlglot.parse_one(query, read=self._dialect)
+        # Avoid recomputing subexpression metadata when traversed multiple times.
+        self._subexpression_tables_cache: Dict[Tuple[int, int], List[str]] = {}
+        self._subexpression_columns_cache: Dict[
+            Tuple[int, int, int], Dict[str, Dict[str, Any]]
+        ] = {}
         self._source_tables: List[str] = []
         self._alias_column_lineage: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
         self._alias_display_names: Dict[str, str] = {}
@@ -199,9 +204,20 @@ class QueryParser:
         return identifier.sql(dialect=self._dialect)
 
     def _extract_source_columns(self) -> List[Column]:
-        """Walk the AST collecting every unique column/table pairing."""
+        """
+        Walk the full AST collecting every unique column/table pairing.
+        Captures any column reference across clauses (SELECT, WHERE, JOIN, etc.),
+        collapsing duplicates by column name + potential tables.
+        """
         result: List[Column] = []
         seen: set[tuple[str, tuple[str, ...]]] = set()
+
+        def _record(column: Column) -> None:
+            key = (column.col_name.lower(), tuple(column.potential_tables))
+            if key in seen:
+                return
+            seen.add(key)
+            result.append(column)
 
         for column in self._expression.find_all(exp.Column):
             column_name = column.name
@@ -214,14 +230,7 @@ class QueryParser:
             if column_name == "*":
                 expanded = self._expand_star_column(column, select_context)
                 for expanded_column in expanded:
-                    key = (
-                        expanded_column.col_name.lower(),
-                        tuple(expanded_column.potential_tables),
-                    )
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    result.append(expanded_column)
+                    _record(expanded_column)
                 continue
 
             potential_tables = self._resolve_column_sources(
@@ -241,26 +250,26 @@ class QueryParser:
                     tables = entry.get("tables", [])
                     if not name or not tables:
                         continue
-                    key = (name.lower(), tuple(tables))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    result.append(Column(col_name=name, potential_tables=list(tables)))
+                    _record(Column(col_name=name, potential_tables=list(tables)))
                 continue
-            key = (column_name.lower(), tuple(potential_tables))
-            if key in seen:
-                continue
+            _record(Column(col_name=column_name, potential_tables=potential_tables))
 
-            seen.add(key)
-            result.append(
-                Column(col_name=column_name, potential_tables=potential_tables)
-            )
+        for star in self._expression.find_all(exp.Star):
+            select = star.find_ancestor(exp.Select)
+            select_context = self._select_context(select)
+            expanded = self._expand_star_column(star, select_context)
+            for expanded_column in expanded:
+                _record(expanded_column)
 
         physical_columns = [column for column in result if not column.lineage]
         return self._filter_redundant_ambiguity(physical_columns)
 
     def _extract_select_columns(self) -> List[dict]:
-        """Collect source columns used by output projections."""
+        """
+        Collect source columns that feed the final SELECT list.
+        Each entry is {"column": Column, "direct": bool}, where direct means the
+        projection is a bare column mapping 1:1 to a single source table.
+        """
         entries: Dict[tuple[str, tuple[str, ...]], dict] = {}
         for select in self._final_selects(self._expression):
             context = self._select_context(select)
@@ -277,7 +286,11 @@ class QueryParser:
         return list(entries.values())
 
     def _final_selects(self, expression: Optional[exp.Expression]) -> List[exp.Select]:
-        """Return SELECT nodes that produce the query output."""
+        """
+        Return SELECT nodes that produce the query output.
+        Drills through WITH wrappers, subqueries, parentheses, and set operations
+        to find the terminal SELECT statements visible to the caller.
+        """
         if expression is None:
             return []
         if isinstance(expression, exp.With):
@@ -295,7 +308,10 @@ class QueryParser:
     def _projection_columns(
         self, projection: exp.Expression, context: dict
     ) -> List[tuple[Column, bool]]:
-        """Return (Column, direct) pairs feeding a SELECT projection."""
+        """
+        Return (Column, direct) pairs feeding a single SELECT projection.
+        The direct flag is only true for bare column projections with a single source.
+        """
         target = projection.this if isinstance(projection, exp.Alias) else projection
         if isinstance(target, exp.Column):
             return self._column_projection(target, context)
@@ -306,29 +322,36 @@ class QueryParser:
     def _column_projection(
         self, column: exp.Column, context: dict
     ) -> List[tuple[Column, bool]]:
-        """Handle projection columns, expanding stars and lineage."""
+        """
+        Handle projection columns, expanding stars and flattening lineage into sources.
+        Returns the physical source columns that back this projection plus the direct flag.
+        """
         if column.name == "*":
             return self._star_projection(column, context)
 
+        column_obj = self._column_from_expression(column, context)
         lineage_entries = self._column_lineage_for_reference(
             column.table, context, column.name
         )
         if lineage_entries:
-            return self._lineage_columns(lineage_entries, allow_direct=True)
+            columns = self._lineage_columns(lineage_entries, allow_direct=True)
+            if column_obj:
+                for col, _ in columns:
+                    col.potential_tables = self._merge_sources(
+                        col.potential_tables, column_obj.potential_tables
+                    )
+            return columns
 
-        column_obj = self._column_from_expression(column, context)
         return [(column_obj, True)] if column_obj else []
 
     def _star_projection(
         self, column: exp.Column, context: dict
     ) -> List[tuple[Column, bool]]:
-        """Return column mappings for ``*`` projections."""
+        """Return column mappings for ``*`` projections using relation metadata."""
         columns: List[tuple[Column, bool]] = []
         for relation in self._relations_for_qualifier(context, column.table):
             for entry in (relation.get("columns") or {}).values():
-                columns.extend(
-                    self._lineage_columns([entry], allow_direct=True)
-                )
+                columns.extend(self._lineage_columns([entry], allow_direct=True))
         return columns
 
     def _lineage_columns(
@@ -336,23 +359,38 @@ class QueryParser:
     ) -> List[tuple[Column, bool]]:
         """Convert lineage-style entries into Column objects with direct flags."""
         leaves = self._lineage_leaf_entries(entries)
-        columns: List[Column] = []
+        merged: Dict[str, Column] = {}
         for leaf in leaves:
             name = leaf.get("name")
             tables = list(leaf.get("tables") or [])
             if not name or not tables:
                 continue
-            columns.append(Column(col_name=name, potential_tables=tables))
+            key = name.lower()
+            if key in merged:
+                merged[key].potential_tables = self._merge_sources(
+                    merged[key].potential_tables, tables
+                )
+            else:
+                merged[key] = Column(col_name=name, potential_tables=tables)
 
-        direct = allow_direct and len(columns) == 1
+        columns = list(merged.values())
+        direct = (
+            allow_direct
+            and len(columns) == 1
+            and len(columns[0].potential_tables) == 1
+        )
         return [(column, direct) for column in columns]
 
     def _expand_star_column(
-        self, column: exp.Column, select_context: dict
+        self, column: exp.Expression, select_context: dict
     ) -> List[Column]:
-        """Expand ``*`` projections using the cached relation lineage."""
+        """
+        Expand ``*`` projections using cached relation lineage.
+        Includes derived columns from subqueries so callers see all surfaced fields.
+        """
 
-        targets = self._relations_for_qualifier(select_context, column.table)
+        qualifier = getattr(column, "table", None)
+        targets = self._relations_for_qualifier(select_context, qualifier)
 
         expanded: List[Column] = []
         for relation in targets:
@@ -362,22 +400,19 @@ class QueryParser:
                     continue
                 tables = list(entry.get("tables") or [])
                 lineage_leaves = self._lineage_leaf_entries(entry.get("lineage"))
-                if lineage_leaves:
-                    for component in lineage_leaves:
-                        component_name = component.get("name")
-                        component_tables = component.get("tables", [])
-                        if not component_name or not component_tables:
-                            continue
-                        expanded.append(
-                            Column(
-                                col_name=component_name,
-                                potential_tables=list(component_tables),
-                            )
+                if tables:
+                    expanded.append(Column(col_name=name, potential_tables=tables))
+                for component in lineage_leaves:
+                    component_name = component.get("name")
+                    component_tables = component.get("tables", [])
+                    if not component_name or not component_tables:
+                        continue
+                    expanded.append(
+                        Column(
+                            col_name=component_name,
+                            potential_tables=list(component_tables),
                         )
-                    continue
-                if not tables:
-                    continue
-                expanded.append(Column(col_name=name, potential_tables=tables))
+                    )
         return expanded
 
     def _resolve_column_sources(
@@ -386,7 +421,11 @@ class QueryParser:
         select_context: Optional[dict] = None,
         column_name: Optional[str] = None,
     ) -> List[str]:
-        """Resolve a column's potential tables given the surrounding context."""
+        """
+        Resolve a column's potential tables given the nearest SELECT context.
+        Prefers qualified relation metadata, then alias lineage, then defaults to
+        FROM sources when ambiguity remains.
+        """
         select_context = select_context or {}
         default_tables = select_context.get("default_tables", self._source_tables[:])
         relations = select_context.get("relations", [])
@@ -607,7 +646,10 @@ class QueryParser:
         Dict[str, List[str]],
         Dict[str, Dict[str, Dict[str, List[str]]]],
     ]:
-        """Collect table + column lineage produced by WITH clauses."""
+        """
+        Collect table and column lineage produced by WITH clauses.
+        Returns updated contexts so downstream SELECTs can resolve CTE references.
+        """
         context: Dict[str, List[str]] = dict(outer_context or {})
         definitions: Dict[str, List[str]] = {}
         column_definitions: Dict[str, Dict[str, Dict[str, List[str]]]] = dict(
@@ -637,9 +679,17 @@ class QueryParser:
         expression: exp.Expression,
         outer_context: Optional[Dict[str, List[str]]] = None,
     ) -> List[str]:
-        """Return ordered tables referenced inside ``expression``."""
+        """
+        Return ordered tables referenced inside ``expression`` (including nested CTEs).
+        Results are cached per expression id and normalized table context.
+        """
 
         context, _, _ = self._collect_cte_sources(expression, dict(outer_context or {}))
+        # Cache per expression and table context signature; avoids rewalking CTE chains.
+        cache_key = (id(expression), hash(self._table_context_key(context)))
+        if cache_key in self._subexpression_tables_cache:
+            return list(self._subexpression_tables_cache[cache_key])
+
         tables: List[str] = []
         seen: set[str] = set()
 
@@ -650,6 +700,7 @@ class QueryParser:
                     tables.append(source)
                     seen.add(source)
 
+        self._subexpression_tables_cache[cache_key] = list(tables)
         return tables
 
     def _columns_for_subexpression(
@@ -658,11 +709,47 @@ class QueryParser:
         table_context: Optional[Dict[str, List[str]]] = None,
         column_context: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
     ) -> Dict[str, Dict[str, List[str]]]:
-        """Return a mapping of column alias -> {name,tables} for ``expression``."""
+        """
+        Return a mapping of column alias -> {name,tables,lineage} for ``expression``.
+        Supports SELECT bodies and set operations, keyed by expression and contexts.
+        """
         table_context = table_context or {}
         column_context = column_context or {}
 
         target = expression.this if isinstance(expression, exp.Subquery) else expression
+        # Cache per expression plus normalized table/column contexts to reuse lineage.
+        cache_key = (
+            id(target),
+            hash(self._table_context_key(table_context)),
+            hash(self._column_context_key(column_context)),
+        )
+        if cache_key in self._subexpression_columns_cache:
+            return self._subexpression_columns_cache[cache_key]
+
+        if isinstance(target, exp.SetOperation):
+            left = self._columns_for_subexpression(
+                target.this, table_context, column_context
+            )
+            right = self._columns_for_subexpression(
+                target.args.get("expression"), table_context, column_context
+            )
+            merged: Dict[str, Dict[str, Any]] = {
+                key: dict(value) for key, value in (left or {}).items()
+            }
+            for key, entry in (right or {}).items():
+                if key in merged:
+                    merged_entry = merged[key]
+                    merged_entry["tables"] = self._merge_sources(
+                        list(merged_entry.get("tables", [])),
+                        list(entry.get("tables", [])),
+                    )
+                    if entry.get("lineage") and not merged_entry.get("lineage"):
+                        merged_entry["lineage"] = entry["lineage"]
+                else:
+                    merged[key] = dict(entry)
+            self._subexpression_columns_cache[cache_key] = merged
+            return merged
+
         if not isinstance(target, exp.Select):
             return {}
 
@@ -670,6 +757,14 @@ class QueryParser:
         lineage: Dict[str, Dict[str, List[str]]] = {}
 
         for projection in target.expressions or []:
+            if isinstance(projection, exp.Star):
+                expanded = self._expand_star_column(projection, context)
+                for expanded_column in expanded:
+                    lineage[expanded_column.col_name.lower()] = {
+                        "name": expanded_column.col_name,
+                        "tables": expanded_column.potential_tables,
+                    }
+                continue
             output_name = self._output_column_name(projection)
             if not output_name:
                 continue
@@ -693,6 +788,7 @@ class QueryParser:
                     entry["lineage"] = projection_lineage
                 lineage[output_name.lower()] = entry
 
+        self._subexpression_columns_cache[cache_key] = lineage
         return lineage
 
     def _sources_for_table_reference(
@@ -869,6 +965,46 @@ class QueryParser:
                 merged.append(source)
                 seen.add(source)
         return merged
+
+    def _table_context_key(self, ctx: Optional[Dict[str, List[str]]]) -> tuple:
+        """Create a stable, hashable key for table context maps."""
+        return tuple(sorted((key, tuple(value)) for key, value in (ctx or {}).items()))
+
+    def _column_context_key(
+        self, ctx: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]]
+    ) -> tuple:
+        """Create a stable, hashable key for nested column lineage maps."""
+
+        def _entry_key(entry: Optional[dict]) -> tuple:
+            if not entry:
+                return ("", (), ())
+            name = entry.get("name") or ""
+            tables = tuple(entry.get("tables") or [])
+            leaves = tuple(
+                sorted(
+                    (
+                        leaf.get("name") or "",
+                        tuple(leaf.get("tables") or []),
+                    )
+                    for leaf in self._lineage_leaf_entries(entry.get("lineage"))
+                )
+            )
+            return (name, tables, leaves)
+
+        normalized = []
+        for alias, columns in (ctx or {}).items():
+            normalized.append(
+                (
+                    alias,
+                    tuple(
+                        sorted(
+                            (column, _entry_key(entry))
+                            for column, entry in (columns or {}).items()
+                        )
+                    ),
+                )
+            )
+        return tuple(sorted(normalized))
 
     def _relations_for_qualifier(
         self, select_context: dict, qualifier: Optional[str]
@@ -1108,8 +1244,13 @@ class QueryParser:
 
         return list(default_tables)
 
-    def _projection_lineage(self, projection: exp.Expression, context: dict) -> List[dict]:
-        """Return normalized column lineage entries for a projection expression."""
+    def _projection_lineage(
+        self, projection: exp.Expression, context: dict
+    ) -> List[dict]:
+        """
+        Return normalized lineage entries for a projection expression.
+        Captures dependency column names, their tables, and any nested lineage info.
+        """
         dependencies: List[dict] = []
         seen: set[tuple[str, tuple[str, ...]]] = set()
 
@@ -1147,7 +1288,10 @@ class QueryParser:
         select_context: Optional[dict],
         column_name: Optional[str],
     ) -> List[dict]:
-        """Return normalized lineage entries for a column reference if known."""
+        """
+        Return normalized lineage entries for a column reference if known.
+        Searches qualified relations, alias lineage, and projection lineage in order.
+        """
         if not column_name:
             return []
         select_context = select_context or {}
@@ -1187,9 +1331,7 @@ class QueryParser:
         extend_from_entry(projection_lineage.get(column_key))
         return matches
 
-    def _build_lineage_columns(
-        self, entries: Optional[List[dict]]
-    ) -> List[Column]:
+    def _build_lineage_columns(self, entries: Optional[List[dict]]) -> List[Column]:
         """Convert normalized lineage metadata into Column objects."""
         lineage_columns: List[Column] = []
         for entry in entries or []:

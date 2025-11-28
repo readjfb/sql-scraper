@@ -462,9 +462,7 @@ TEST_CASES = [
                 "columns": [
                     {
                         "name": "EFF_DT",
-                        "potential_tables": [
-                            "COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE"
-                        ],
+                        "potential_tables": ["COMPANY_DB.CUST_SCHEMA.CUSTOMER_TABLE"],
                     }
                 ],
             },
@@ -638,7 +636,10 @@ TEST_CASES = [
             {"name": "account_id", "potential_tables": ["core.accounts"]},
             {"name": "balance", "potential_tables": ["core.accounts"]},
             {"name": "updated_at", "potential_tables": ["core.accounts"]},
-            {"name": "balance_bucket", "potential_tables": ["analytics.balance_lookup"]},
+            {
+                "name": "balance_bucket",
+                "potential_tables": ["analytics.balance_lookup"],
+            },
             {"name": "bucket_start", "potential_tables": ["analytics.balance_lookup"]},
         ],
         "expected_joins": [
@@ -973,8 +974,7 @@ class QueryParserTests(unittest.TestCase):
                 "filter_type": entry["filter_type"],
                 "operator": entry["operator"],
                 "columns": [
-                    self._normalize_filter_column(column)
-                    for column in entry["columns"]
+                    self._normalize_filter_column(column) for column in entry["columns"]
                 ],
             }
             normalized_entry["columns"].sort(
@@ -1008,7 +1008,11 @@ class QueryParserTests(unittest.TestCase):
             )
         return sorted(
             normalized,
-            key=lambda col: (col["name"], tuple(col["potential_tables"]), col["direct"]),
+            key=lambda col: (
+                col["name"],
+                tuple(col["potential_tables"]),
+                col["direct"],
+            ),
         )
 
     def test_queries_against_expectations(self):
@@ -1052,11 +1056,9 @@ class QueryParserTests(unittest.TestCase):
                         column_spec = expectation["column"]
                         target_column = None
                         for column in target_filter["columns"]:
-                            if (
-                                column.col_name == column_spec["name"]
-                                and sorted(column.potential_tables)
-                                == sorted(column_spec["potential_tables"])
-                            ):
+                            if column.col_name == column_spec["name"] and sorted(
+                                column.potential_tables
+                            ) == sorted(column_spec["potential_tables"]):
                                 target_column = column
                                 break
                         self.assertIsNotNone(
@@ -1110,6 +1112,7 @@ class QueryParserTests(unittest.TestCase):
             [
                 {"name": "ID", "potential_tables": ["SALES_DB.PUBLIC.TABLE_A"]},
                 {"name": "AMOUNT", "potential_tables": ["SALES_DB.PUBLIC.TABLE_A"]},
+                {"name": "DOUBLED", "potential_tables": ["SALES_DB.PUBLIC.TABLE_A"]},
             ]
         )
         actual_columns = self._normalize_columns(parser.feature_columns())
@@ -1143,9 +1146,7 @@ class QueryParserTests(unittest.TestCase):
         """
         parser = QueryParser(query)
         target_filter = next(
-            entry
-            for entry in parser.filters()
-            if entry["query"] == "outer_amount > 10"
+            entry for entry in parser.filters() if entry["query"] == "outer_amount > 10"
         )
         target_column = next(
             column
@@ -1170,7 +1171,9 @@ class QueryParserTests(unittest.TestCase):
         if outer_entry:
             outer_dependencies = outer_entry.get("lineage") or []
             self.assertTrue(
-                any(child.get("name") == "inner_amount" for child in outer_dependencies),
+                any(
+                    child.get("name") == "inner_amount" for child in outer_dependencies
+                ),
                 "outer_amount should depend on inner_amount",
             )
 
@@ -1225,6 +1228,47 @@ class QueryParserTests(unittest.TestCase):
             [
                 {"name": "a", "potential_tables": ["TABLE_C"], "direct": False},
                 {"name": "b", "potential_tables": ["TABLE_C"], "direct": False},
+            ],
+            columns,
+        )
+
+    def test_set_operation_lineage_preserved(self):
+        query = """
+        WITH union_cte AS (
+            SELECT id, amount FROM T1
+            UNION ALL
+            SELECT id, amount FROM T2
+        )
+        SELECT id, amount FROM union_cte
+        """
+        parser = QueryParser(query)
+        columns = self._normalize_select_columns(parser.select_columns())
+        self.assertEqual(
+            [
+                {"name": "amount", "potential_tables": ["T1", "T2"], "direct": True},
+                {"name": "id", "potential_tables": ["T1", "T2"], "direct": True},
+            ],
+            columns,
+        )
+
+    def test_star_expansion_includes_derived_outputs(self):
+        query = """
+        SELECT *
+        FROM (
+            SELECT
+                a,
+                b,
+                a + b AS sum_ab
+            FROM SOURCE_TABLE
+        )
+        """
+        parser = QueryParser(query)
+        columns = self._normalize_columns(parser.feature_columns())
+        self.assertEqual(
+            [
+                {"name": "a", "potential_tables": ["SOURCE_TABLE"]},
+                {"name": "b", "potential_tables": ["SOURCE_TABLE"]},
+                {"name": "sum_ab", "potential_tables": ["SOURCE_TABLE"]},
             ],
             columns,
         )
