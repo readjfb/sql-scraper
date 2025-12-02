@@ -50,7 +50,11 @@ class QueryParser:
             return self._source_columns
 
     def select_columns(self) -> List[dict]:
-        """Return columns that surface in the SELECT list with direct/derived flags."""
+        """
+        Return columns that surface in the SELECT list with direct/derived flags.
+        Note: SELECT * projections are not included here; only explicit projections
+        contribute columns to this result.
+        """
         with self._lock:
             if self._select_columns is None:
                 self._select_columns = self._extract_select_columns()
@@ -234,6 +238,9 @@ class QueryParser:
         """
         result: List[Column] = []
         seen: set[tuple[str, tuple[str, ...]]] = set()
+        sources_cache: Dict[tuple[int, Optional[str], str], List[str]] = {}
+        lineage_cache: Dict[tuple[int, Optional[str], str], List[Dict[str, Any]]] = {}
+        star_cache: Dict[tuple[int, Optional[str]], List[Column]] = {}
 
         def _record(column: Column) -> None:
             key = (column.col_name.lower(), tuple(column.potential_tables))
@@ -249,38 +256,56 @@ class QueryParser:
 
             select = column.find_ancestor(exp.Select)
             select_context = self._select_context(select)
+            select_key = id(select_context)
 
             if column_name == "*":
-                expanded = self._expand_star_column(column, select_context)
+                cache_key = (select_key, column.table)
+                expanded = star_cache.get(cache_key)
+                if expanded is None:
+                    expanded = self._expand_star_column(column, select_context)
+                    star_cache[cache_key] = expanded
                 for expanded_column in expanded:
                     _record(expanded_column)
                 continue
 
-            potential_tables = self._resolve_column_sources(
-                column.table,
-                select_context,
-                column_name,
-            )
-            lineage_entries = self._column_lineage_for_reference(
-                column.table,
-                select_context,
-                column_name,
-            )
+            cache_key = (select_key, column.table, column_name.lower())
+            potential_tables = sources_cache.get(cache_key)
+            if potential_tables is None:
+                potential_tables = self._resolve_column_sources(
+                    column.table,
+                    select_context,
+                    column_name,
+                )
+                sources_cache[cache_key] = potential_tables
+
+            lineage_entries = lineage_cache.get(cache_key)
+            if lineage_entries is None:
+                lineage_entries = self._column_lineage_for_reference(
+                    column.table,
+                    select_context,
+                    column_name,
+                )
+                lineage_cache[cache_key] = lineage_entries
             if lineage_entries:
-                normalized_entries = self._lineage_leaf_entries(lineage_entries)
-                for entry in normalized_entries:
-                    name = entry.get("name")
-                    tables = entry.get("tables", [])
-                    if not name or not tables:
-                        continue
-                    _record(Column(col_name=name, potential_tables=list(tables)))
+                for leaf in self._leaf_columns_from_entries(lineage_entries):
+                    if leaf.col_name and leaf.potential_tables:
+                        _record(
+                            Column(
+                                col_name=leaf.col_name,
+                                potential_tables=list(leaf.potential_tables),
+                            )
+                        )
                 continue
             _record(Column(col_name=column_name, potential_tables=potential_tables))
 
         for star in self._expression.find_all(exp.Star):
             select = star.find_ancestor(exp.Select)
             select_context = self._select_context(select)
-            expanded = self._expand_star_column(star, select_context)
+            cache_key = (id(select_context), getattr(star, "table", None))
+            expanded = star_cache.get(cache_key)
+            if expanded is None:
+                expanded = self._expand_star_column(star, select_context)
+                star_cache[cache_key] = expanded
             for expanded_column in expanded:
                 _record(expanded_column)
 
@@ -381,20 +406,21 @@ class QueryParser:
         self, entries: Optional[List[Any]], allow_direct: bool
     ) -> List[tuple[Column, bool]]:
         """Convert lineage-style entries into Column objects with direct flags."""
-        leaves = self._lineage_leaf_entries(entries)
+        leaves = self._leaf_columns_from_entries(entries)
         merged: Dict[str, Column] = {}
         for leaf in leaves:
-            name = leaf.get("name")
-            tables = list(leaf.get("tables") or [])
-            if not name or not tables:
+            if not leaf.col_name or not leaf.potential_tables:
                 continue
-            key = name.lower()
+            key = leaf.col_name.lower()
             if key in merged:
                 merged[key].potential_tables = self._merge_sources(
-                    merged[key].potential_tables, tables
+                    merged[key].potential_tables, leaf.potential_tables
                 )
             else:
-                merged[key] = Column(col_name=name, potential_tables=tables)
+                merged[key] = Column(
+                    col_name=leaf.col_name,
+                    potential_tables=list(leaf.potential_tables),
+                )
 
         columns = list(merged.values())
         direct = (
@@ -422,20 +448,16 @@ class QueryParser:
                 if not name:
                     continue
                 tables = list(entry.get("tables") or [])
-                lineage_leaves = self._lineage_leaf_entries(entry.get("lineage"))
                 if tables:
                     expanded.append(Column(col_name=name, potential_tables=tables))
-                for component in lineage_leaves:
-                    component_name = component.get("name")
-                    component_tables = component.get("tables", [])
-                    if not component_name or not component_tables:
-                        continue
-                    expanded.append(
-                        Column(
-                            col_name=component_name,
-                            potential_tables=list(component_tables),
+                for component in self._leaf_columns_from_entries(entry.get("lineage")):
+                    if component.col_name and component.potential_tables:
+                        expanded.append(
+                            Column(
+                                col_name=component.col_name,
+                                potential_tables=list(component.potential_tables),
+                            )
                         )
-                    )
         return expanded
 
     def _resolve_column_sources(
@@ -455,23 +477,9 @@ class QueryParser:
         column_key = column_name.lower() if column_name else None
 
         if qualifier:
-            qualifier_lower = qualifier.lower()
-            for relation in self._relations_for_qualifier(select_context, qualifier):
-                columns = relation.get("columns") or {}
-                entry = columns.get(column_key) if column_key else None
-                if entry:
-                    return list(entry.get("tables", []))
-                return list(relation.get("tables", []))
-
-            alias_variants = [qualifier, qualifier_lower, qualifier.upper()]
-            for alias in alias_variants:
-                resolved = self._alias_to_table.get(alias)
-                if resolved:
-                    lineage = self._alias_column_lineage.get(alias.lower(), {})
-                    if column_key and column_key in lineage:
-                        return list(lineage[column_key].get("tables", []))
-                    return list(resolved)
-            return [qualifier]
+            return self._resolve_qualified_column_sources(
+                qualifier, select_context, column_key
+            )
 
         matches: List[str] = []
         matched = False
@@ -614,16 +622,21 @@ class QueryParser:
         for column in filter_entry.get("columns", []):
             direct = not column.lineage
             if not direct and column.lineage:
-                leaves = self._lineage_leaf_entries(column.lineage)
+                lineage_sets = column.lineage_column_sets()
+                leaves = (lineage_sets.get("known_columns") or []) + (
+                    lineage_sets.get("potential_columns") or []
+                )
                 # Direct if lineage collapses to a single physical column in one table.
-                if (
-                    len(leaves) == 1
-                    and len(leaves[0].get("tables", [])) == 1
-                    and (leaves[0].get("name") or "").lower()
-                    == column.col_name.lower()
-                ):
-                    direct = True
-                    column.lineage = None
+                if len(leaves) == 1:
+                    leaf = leaves[0]
+                    leaf_sources = list(leaf.potential_tables or [])
+                    if (
+                        len(leaf_sources) == 1
+                        and leaf.col_name.lower() == column.col_name.lower()
+                    ):
+                        direct = True
+                        column.lineage = None
+                        column.potential_tables = leaf_sources
                 # Also direct if lineage is just a passthrough of the same column.
                 elif (
                     len(column.lineage) == 1
@@ -683,16 +696,15 @@ class QueryParser:
         lineage_entries = self._column_lineage_for_reference(
             column.table, select_context, column.name
         )
-        lineage_columns = self._build_lineage_columns(lineage_entries)
+        lineage_columns = self._columns_from_entries(lineage_entries)
         column_obj.lineage = lineage_columns or None
         # If lineage exists, prefer the most concrete leaf tables for provenance.
         if lineage_columns:
-            leaves = self._lineage_leaf_entries(lineage_entries)
-            merged_tables = []
-            for leaf in leaves:
-                merged_tables = self._merge_sources(
-                    merged_tables, list(leaf.get("tables") or [])
-                )
+            table_sets = column_obj.lineage_table_sets()
+            merged_tables = self._merge_sources(
+                table_sets.get("known_tables") or [],
+                table_sets.get("potential_tables") or [],
+            )
             if merged_tables:
                 column_obj.potential_tables = merged_tables
             # Do not keep redundant self-referential lineage (e.g., alias passthrough).
@@ -716,6 +728,33 @@ class QueryParser:
             entry.get("name") or column_key: list(entry.get("tables", []))
             for column_key, entry in lineage.items()
         }
+
+    def _resolve_qualified_column_sources(
+        self,
+        qualifier: str,
+        select_context: dict,
+        column_key: Optional[str],
+    ) -> List[str]:
+        """
+        Resolve sources for qualified columns via relation metadata or alias lineage.
+        """
+        qualifier_lower = qualifier.lower()
+        for relation in self._relations_for_qualifier(select_context, qualifier):
+            columns = relation.get("columns") or {}
+            entry = columns.get(column_key) if column_key else None
+            if entry:
+                return list(entry.get("tables", []))
+            return list(relation.get("tables", []))
+
+        alias_variants = [qualifier, qualifier_lower, qualifier.upper()]
+        for alias in alias_variants:
+            resolved = self._alias_to_table.get(alias)
+            if resolved:
+                lineage = self._alias_column_lineage.get(alias.lower(), {})
+                if column_key and column_key in lineage:
+                    return list(lineage[column_key].get("tables", []))
+                return list(resolved)
+        return [qualifier]
 
     def _collect_cte_sources(
         self,
@@ -1047,9 +1086,20 @@ class QueryParser:
                 seen.add(source)
         return merged
 
+    def _normalize_context(
+        self, ctx: Optional[Dict[Any, Any]], formatter: Any
+    ) -> tuple:
+        """
+        Build a stable tuple key from arbitrary context maps using formatter output.
+        """
+        normalized = []
+        for key, value in (ctx or {}).items():
+            normalized.append((key, formatter(key, value)))
+        return tuple(sorted(normalized))
+
     def _table_context_key(self, ctx: Optional[Dict[str, List[str]]]) -> tuple:
         """Create a stable, hashable key for table context maps."""
-        return tuple(sorted((key, tuple(value)) for key, value in (ctx or {}).items()))
+        return self._normalize_context(ctx, lambda _, value: tuple(value or ()))
 
     def _column_context_key(
         self, ctx: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]]
@@ -1064,28 +1114,23 @@ class QueryParser:
             leaves = tuple(
                 sorted(
                     (
-                        leaf.get("name") or "",
-                        tuple(leaf.get("tables") or []),
+                        leaf.col_name or "",
+                        tuple(leaf.potential_tables or []),
                     )
-                    for leaf in self._lineage_leaf_entries(entry.get("lineage"))
+                    for leaf in self._leaf_columns_from_entries(entry.get("lineage"))
                 )
             )
             return (name, tables, leaves)
 
-        normalized = []
-        for alias, columns in (ctx or {}).items():
-            normalized.append(
-                (
-                    alias,
-                    tuple(
-                        sorted(
-                            (column, _entry_key(entry))
-                            for column, entry in (columns or {}).items()
-                        )
-                    ),
+        return self._normalize_context(
+            ctx,
+            lambda _, columns: tuple(
+                sorted(
+                    (column, _entry_key(entry))
+                    for column, entry in (columns or {}).items()
                 )
-            )
-        return tuple(sorted(normalized))
+            ),
+        )
 
     def _relations_for_qualifier(
         self, select_context: dict, qualifier: Optional[str]
@@ -1412,25 +1457,6 @@ class QueryParser:
         extend_from_entry(projection_lineage.get(column_key))
         return matches
 
-    def _build_lineage_columns(self, entries: Optional[List[dict]]) -> List[Column]:
-        """Convert normalized lineage metadata into Column objects."""
-        lineage_columns: List[Column] = []
-        for entry in entries or []:
-            name = entry.get("name")
-            if not name:
-                continue
-            tables = list(entry.get("tables") or [])
-            nested_entries = entry.get("lineage")
-            nested_columns = self._build_lineage_columns(nested_entries)
-            lineage_columns.append(
-                Column(
-                    col_name=name,
-                    potential_tables=tables,
-                    lineage=nested_columns or None,
-                )
-            )
-        return lineage_columns
-
     def _normalize_lineage_entries(
         self, entries: Optional[List[Any]]
     ) -> List[Dict[str, Any]]:
@@ -1461,19 +1487,51 @@ class QueryParser:
             normalized.append(normalized_entry)
         return normalized
 
-    def _lineage_leaf_entries(
+    def _columns_from_entries(self, entries: Optional[List[Any]]) -> List[Column]:
+        """Convert raw lineage entries (dicts/Columns) into Column objects."""
+        columns, _ = self._columns_and_leaves_from_entries(entries)
+        return columns
+
+    def _columns_and_leaves_from_entries(
         self, entries: Optional[List[Any]]
-    ) -> List[Dict[str, Any]]:
-        """Return only terminal lineage entries with concrete table mappings."""
-        leaves: List[Dict[str, Any]] = []
+    ) -> tuple[List[Column], List[Column]]:
+        """
+        Convert lineage entries into Columns and also collect leaf Columns.
+        """
+        columns: List[Column] = []
+        leaves: List[Column] = []
         for entry in self._normalize_lineage_entries(entries):
-            nested = entry.get("lineage")
-            if nested:
-                leaves.extend(self._lineage_leaf_entries(nested))
-                continue
             name = entry.get("name")
-            tables = list(entry.get("tables") or [])
-            if not name or not tables:
+            if not name:
                 continue
-            leaves.append({"name": name, "tables": tables})
-        return leaves
+            tables = list(entry.get("tables") or [])
+            nested_entries = entry.get("lineage")
+            nested_columns, nested_leaves = self._columns_and_leaves_from_entries(
+                nested_entries
+            )
+            column_obj = Column(
+                col_name=name,
+                potential_tables=tables,
+                lineage=nested_columns or None,
+            )
+            columns.append(column_obj)
+            if nested_columns:
+                leaves.extend(nested_leaves)
+            else:
+                leaves.append(column_obj)
+        return columns, leaves
+
+    def _leaf_columns_from_entries(
+        self, entries: Optional[List[Any]]
+    ) -> List[Column]:
+        """Convert lineage entries (dicts or Columns) into leaf Column objects."""
+        _, leaves = self._columns_and_leaves_from_entries(entries)
+        deduped: List[Column] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for leaf in leaves:
+            key = (leaf.col_name.lower(), tuple(leaf.potential_tables))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(leaf)
+        return deduped
