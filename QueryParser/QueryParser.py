@@ -529,12 +529,13 @@ class QueryParser:
         if not from_clause:
             return joins
 
+        select_context = self._select_context(select)
         left_sources = self._relation_sources(from_clause.this)
         for join in select.args.get("joins") or []:
             join_type = self._format_join_type(join)
             right_sources = self._relation_sources(join.args.get("this"))
             condition_pairs = self._columns_from_condition(
-                join.args.get("on"), left_sources, right_sources
+                join.args.get("on"), left_sources, right_sources, select_context
             )
             condition_pairs.extend(
                 self._columns_from_using(
@@ -618,6 +619,13 @@ class QueryParser:
         A column is direct when it has no lineage or when its lineage resolves to a
         single physical column in one table (including simple alias passthroughs).
         """
+        def _clone(col: Column) -> Column:
+            return Column(
+                col_name=col.col_name,
+                potential_tables=list(col.potential_tables),
+                lineage=[_clone(child) for child in col.lineage] if col.lineage else None,
+            )
+
         result: List[Column] = []
         for column in filter_entry.get("columns", []):
             direct = not column.lineage
@@ -635,8 +643,13 @@ class QueryParser:
                         and leaf.col_name.lower() == column.col_name.lower()
                     ):
                         direct = True
-                        column.lineage = None
-                        column.potential_tables = leaf_sources
+                        direct_column = Column(
+                            col_name=column.col_name,
+                            potential_tables=leaf_sources,
+                        )
+                        if direct or not return_only_direct:
+                            result.append(direct_column)
+                        continue
                 # Also direct if lineage is just a passthrough of the same column.
                 elif (
                     len(column.lineage) == 1
@@ -647,9 +660,15 @@ class QueryParser:
                     == sorted(column.potential_tables)
                 ):
                     direct = True
-                    column.lineage = None
-            if direct or not return_only_direct:
-                result.append(column)
+            if direct:
+                result.append(
+                    Column(
+                        col_name=column.col_name,
+                        potential_tables=list(column.potential_tables),
+                    )
+                )
+            elif not return_only_direct:
+                result.append(_clone(column))
         return result
 
     def _format_filter_operator(self, comparator: exp.Expression) -> str:
@@ -754,7 +773,7 @@ class QueryParser:
                 if column_key and column_key in lineage:
                     return list(lineage[column_key].get("tables", []))
                 return list(resolved)
-        return [qualifier]
+        return []
 
     def _collect_cte_sources(
         self,
@@ -954,6 +973,7 @@ class QueryParser:
         condition: Optional[exp.Expression],
         left_sources: List[str],
         right_sources: List[str],
+        select_context: Optional[dict],
     ) -> List[dict]:
         """Extract column pair metadata for ON clauses, correcting orientation."""
         result: List[dict] = []
@@ -962,39 +982,41 @@ class QueryParser:
 
         for comparator in self._flatten_conditions(condition):
             left_column, complex_left = self._extract_join_operand(
-                comparator.args.get("this")
+                comparator.args.get("this"),
+                select_context,
             )
             right_column, complex_right = self._extract_join_operand(
-                comparator.args.get("expression")
+                comparator.args.get("expression"),
+                select_context,
             )
 
-            if left_column and right_column:
-                left_from_left = bool(
-                    left_source_set.intersection(left_column.potential_tables)
-                )
-                right_from_left = bool(
-                    left_source_set.intersection(right_column.potential_tables)
-                )
-                left_from_right = bool(
-                    right_source_set.intersection(left_column.potential_tables)
-                )
-                right_from_right = bool(
-                    right_source_set.intersection(right_column.potential_tables)
-                )
+            if not (left_column and right_column):
+                continue
 
-                if not left_from_left and right_from_left:
-                    left_column, right_column = right_column, left_column
-                    complex_left, complex_right = complex_right, complex_left
-                elif not right_from_right and left_from_right:
-                    left_column, right_column = right_column, left_column
-                    complex_left, complex_right = complex_right, complex_left
+            left_from_left = bool(
+                left_source_set.intersection(left_column.potential_tables)
+            )
+            right_from_left = bool(
+                left_source_set.intersection(right_column.potential_tables)
+            )
+            left_from_right = bool(
+                right_source_set.intersection(left_column.potential_tables)
+            )
+            right_from_right = bool(
+                right_source_set.intersection(right_column.potential_tables)
+            )
+
+            if not left_from_left and right_from_left:
+                left_column, right_column = right_column, left_column
+                complex_left, complex_right = complex_right, complex_left
+            elif not right_from_right and left_from_right:
+                left_column, right_column = right_column, left_column
+                complex_left, complex_right = complex_right, complex_left
 
             result.append(
                 {
-                    "column_left": left_column
-                    or Column(col_name="", potential_tables=[]),
-                    "column_right": right_column
-                    or Column(col_name="", potential_tables=[]),
+                    "column_left": left_column,
+                    "column_right": right_column,
                     "complex_left": complex_left,
                     "complex_right": complex_right,
                 }
@@ -1063,18 +1085,13 @@ class QueryParser:
             return None, None
 
         if isinstance(expression, exp.Column):
-            return self._column_from_expression(expression, select_context), None
+            return self._column_with_lineage(expression, select_context), None
 
         complex_sql = expression.sql(dialect=self._dialect)
         nested_column = next(expression.find_all(exp.Column), None)
-        column = (
-            self._column_from_expression(nested_column, select_context)
-            if nested_column
-            else None
-        )
-        if column is None:
-            column = Column(col_name=complex_sql, potential_tables=[])
-        return column, complex_sql
+        if not nested_column:
+            return None, complex_sql
+        return self._column_with_lineage(nested_column, select_context), complex_sql
 
     def _merge_sources(self, left: List[str], right: List[str]) -> List[str]:
         """Append ``right`` onto ``left`` while keeping order + uniqueness."""

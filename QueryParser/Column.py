@@ -50,24 +50,21 @@ class Column:
         stack: List[Column] = [self]
         while stack:
             column = stack.pop()
+            tables = list(column.potential_tables or [])
+            if tables:
+                if len(tables) == 1:
+                    table = tables[0]
+                    if table not in seen_known:
+                        known_tables.append(table)
+                        seen_known.add(table)
+                else:
+                    for table in tables:
+                        if table not in seen_potential:
+                            potential_tables.append(table)
+                            seen_potential.add(table)
+
             if column.lineage:
                 stack.extend(column.lineage)
-                continue
-
-            tables = list(column.potential_tables or [])
-            if not tables:
-                continue
-
-            if len(tables) == 1:
-                table = tables[0]
-                if table not in seen_known:
-                    known_tables.append(table)
-                    seen_known.add(table)
-            else:
-                for table in tables:
-                    if table not in seen_potential:
-                        potential_tables.append(table)
-                        seen_potential.add(table)
 
         return {
             "known_tables": known_tables or None,

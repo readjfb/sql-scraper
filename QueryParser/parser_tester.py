@@ -681,6 +681,58 @@ TEST_CASES = [
         ],
     },
     {
+        "name": "cte_concat_name_join",
+        "query": """
+        WITH CTE AS (
+            SELECT
+                CONCAT(CUST_NM, '-', CUST_SURNAME) AS CUST_NAME,
+                CUST_AGE,
+                EFF_DT
+            FROM MYDB.MYSCHEMA.MYTABLE_ONE
+        )
+        SELECT
+            A.CUST_NAME,
+            A.CUST_AGE,
+            A.EFF_DT
+        FROM
+            CTE A
+        JOIN
+            MYDB.MYSCHEMA.MYTABLE_TWO  B
+        ON 
+            A.CUST_NAME == B.CUSTOMER_NAME
+        """,
+        "expected_columns": [
+            {"name": "CUST_NM", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_ONE"]},
+            {"name": "CUST_SURNAME", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_ONE"]},
+            {"name": "CUST_AGE", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_ONE"]},
+            {"name": "EFF_DT", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_ONE"]},
+            {"name": "CUSTOMER_NAME", "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_TWO"]},
+        ],
+        "expected_joins": [
+            {
+                "join_type": "INNER JOIN",
+                "column_left": {
+                    "name": "CUST_NAME",
+                    "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_ONE"],
+                    "lineage": [
+                        {
+                            "name": "CUST_NM",
+                            "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_ONE"],
+                        },
+                        {
+                            "name": "CUST_SURNAME",
+                            "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_ONE"],
+                        },
+                    ],
+                },
+                "column_right": {
+                    "name": "CUSTOMER_NAME",
+                    "potential_tables": ["MYDB.MYSCHEMA.MYTABLE_TWO"],
+                },
+            }
+        ],
+    },
+    {
         "name": "summed_field_lineage",
         "query": """
         SELECT
@@ -926,10 +978,41 @@ class QueryParserTests(unittest.TestCase):
             if hasattr(column, "col_name"):
                 name = column.col_name
                 tables = list(column.potential_tables)
+                lineage_entries = None
+                if getattr(column, "lineage", None):
+                    sets = column.lineage_column_sets()
+                    leaves = (sets.get("known_columns") or []) + (
+                        sets.get("potential_columns") or []
+                    )
+                    lineage_entries = [
+                        {
+                            "name": leaf.col_name,
+                            "potential_tables": sorted(leaf.potential_tables),
+                        }
+                        for leaf in leaves
+                        if leaf.col_name
+                    ]
+                    name_lower = name.lower() if name else ""
+                    if not any(
+                        entry["name"].lower() != name_lower for entry in lineage_entries
+                    ):
+                        lineage_entries = []
+                if lineage_entries:
+                    lineage_entries = sorted(
+                        lineage_entries,
+                        key=lambda entry: (
+                            entry["name"],
+                            tuple(entry["potential_tables"]),
+                        ),
+                    )
             else:
                 name = column["name"]
                 tables = list(column["potential_tables"])
-            return {"name": name, "potential_tables": sorted(tables)}
+                lineage_entries = self._normalize_lineage_columns(column.get("lineage"))
+            entry = {"name": name, "potential_tables": sorted(tables)}
+            if lineage_entries:
+                entry["lineage"] = lineage_entries
+            return entry
 
         normalized = {
             "join_type": join["join_type"],
@@ -962,11 +1045,19 @@ class QueryParserTests(unittest.TestCase):
     def _normalize_lineage_columns(self, lineage):
         normalized = []
         for column in lineage or []:
-            entry = {
-                "name": column.col_name,
-                "potential_tables": sorted(column.potential_tables),
-            }
-            nested = self._normalize_lineage_columns(column.lineage)
+            if hasattr(column, "col_name"):
+                name = column.col_name
+                tables = column.potential_tables
+                nested = self._normalize_lineage_columns(column.lineage)
+            elif isinstance(column, dict):
+                name = column.get("name")
+                tables = column.get("potential_tables") or column.get("tables") or []
+                nested = self._normalize_lineage_columns(column.get("lineage"))
+            else:
+                continue
+            if not name:
+                continue
+            entry = {"name": name, "potential_tables": sorted(tables)}
             if nested:
                 entry["lineage"] = nested
             normalized.append(entry)
